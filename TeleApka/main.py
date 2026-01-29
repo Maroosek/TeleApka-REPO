@@ -4,7 +4,8 @@ import threading
 import time
 
 # Konfiguracja
-API_URL = "http://192.168.10.111:8020"
+#API_URL = "http://192.168.10.111:8020"
+API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 2
 
 

@@ -4,110 +4,142 @@ import threading
 import time
 
 # Konfiguracja
-#API_URL = "http://localhost:8000"  # Zmiana z 5000 na 8000
-API_URL = "http://192.168.10.111:8000"
-POLL_INTERVAL = 2  # Co ile sekund sprawdzać (w wątku)
+#API_URL = "http://192.168.10.111:8020"
+API_URL = "http://64.225.111.62:8020"
+POLL_INTERVAL = 2
 
 
 class AlertClient:
     def __init__(self, root):
         self.root = root
         self.root.title("System Powiadomień")
-        self.root.geometry("400x250")
+        self.root.geometry("500x400")
 
-        # Zmienne stanu (współdzielone między wątkiem a GUI)
+        # Stan
         self.api_connected = True
-        self.alert_active = False
-        self.alert_message = ""
-        self.last_known_status = "unknown"
+        self.active_alerts = []
+        self.seen_alert_ids = set()  # Zbiór do śledzenia ID powiadomień, które już "mignęły"
 
-        # --- BUDOWA GUI ---
-
-        # 1. Główny komunikat alertu (domyślnie ukryty)
-        self.alert_frame = tk.Frame(root, bg="red")
-        self.alert_label = tk.Label(self.alert_frame, text="", font=("Arial", 16, "bold"), bg="red", fg="white")
-        self.alert_label.pack(pady=20)
-        self.confirm_btn = tk.Button(self.alert_frame, text="Potwierdzam / Zamknij", command=self.send_close_signal)
-        self.confirm_btn.pack(pady=10)
-
-        # 2. Pasek statusu połączenia (na dole)
+        # --- GUI ---
+        # 1. Pasek statusu
         self.status_bar = tk.Label(root, text="Uruchamianie...", bd=1, relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 3. Ekran oczekiwania (gdy brak alertu)
-        self.idle_label = tk.Label(root, text="System czuwa.\nBrak aktywnych zgłoszeń.", font=("Arial", 10))
-        self.idle_label.pack(expand=True)
+        # 2. Ekran oczekiwania (gdy brak alertów)
+        self.idle_frame = tk.Frame(root, bg="#f0f0f0")
+        tk.Label(self.idle_frame, text="System czuwa.\nBrak aktywnych zgłoszeń.",
+                 font=("Arial", 14), fg="#888888", bg="#f0f0f0").pack(expand=True)
 
-        # Uruchomienie wątku sieciowego w tle
-        # daemon=True oznacza, że wątek zamknie się razem z zamknięciem okna
+        # 3. Kontener na alerty (domyślnie ukryty, jeśli brak alertów)
+        self.alerts_container = tk.Frame(root, bg="#ffffff")
+
+        # Wątek sieciowy
         self.thread = threading.Thread(target=self.network_loop, daemon=True)
         self.thread.start()
 
-        # Uruchomienie odświeżania GUI (co 500ms)
+        # Odświeżanie GUI
         self.root.after(500, self.update_gui)
 
     def network_loop(self):
-        """Ta funkcja działa w tle i nigdy nie blokuje okna"""
         while True:
             try:
-                # Próba połączenia (timeout ważny, żeby nie wisiało zbyt długo)
                 response = requests.get(f"{API_URL}/status", timeout=2)
                 data = response.json()
-
-                # Sukces - aktualizujemy zmienne stanu
                 self.api_connected = True
+                self.active_alerts = data.get("alerts", [])
 
-                if data.get('status') == 'active':
-                    self.alert_active = True
-                    self.alert_message = data.get('message', 'Nieznane zgłoszenie')
-                else:
-                    self.alert_active = False
+                # Debug w konsoli
+                print(f"Pętla działa. Aktywne alerty: {len(self.active_alerts)}")
 
             except requests.exceptions.ConnectionError:
                 self.api_connected = False
             except Exception as e:
-                print(f"Inny błąd: {e}")
+                print(f"Błąd API: {e}")
                 self.api_connected = False
 
-            # Czekamy przed kolejnym sprawdzeniem
             time.sleep(POLL_INTERVAL)
 
     def update_gui(self):
-        """Ta funkcja aktualizuje wygląd na podstawie zmiennych stanu"""
-
-        # 1. Obsługa paska statusu (Brak połączenia)
+        # 1. Obsługa paska statusu
         if not self.api_connected:
-            self.status_bar.config(text="⚠ BRAK POŁĄCZENIA Z APLIKACJĄ (API)", bg="orange", fg="black")
-            # Opcjonalnie: Jeśli nie ma sieci, nie zmieniamy stanu okna, zostawiamy ostatni znany
+            self.status_bar.config(text="⚠ BRAK POŁĄCZENIA Z API", bg="orange")
         else:
-            self.status_bar.config(text="Połączono z serwerem", bg="#f0f0f0", fg="green")
+            self.status_bar.config(text=f"Połączono. Aktywne: {len(self.active_alerts)}", bg="#dddddd")
 
-            # 2. Obsługa Alertu (tylko gdy jest połączenie)
-            if self.alert_active:
-                if not self.alert_frame.winfo_ismapped():
-                    self.idle_label.pack_forget()  # Ukryj "czuwanie"
-                    self.alert_frame.pack(fill=tk.BOTH, expand=True)  # Pokaż alert
-                    self.root.deiconify()  # Wyciągnij okno na wierzch
-                    self.root.attributes("-topmost", True)  # Opcjonalnie: zawsze na wierzchu
+        # 2. Logika "Wyskakiwania" okna (Pop-up)
+        # Pobieramy ID wszystkich aktualnych alertów z serwera
+        current_ids = {alert['id'] for alert in self.active_alerts}
 
-                self.alert_label.config(text=self.alert_message)
-            else:
-                if self.alert_frame.winfo_ismapped():
-                    self.alert_frame.pack_forget()  # Ukryj alert
-                    self.idle_label.pack(expand=True)  # Pokaż "czuwanie"
-                    self.root.attributes("-topmost", False)
-                    # Opcjonalnie: self.root.withdraw() jeśli chcesz chować całe okno
+        # Sprawdzamy, czy pojawiło się coś nowego (różnica zbiorów)
+        new_alerts = current_ids - self.seen_alert_ids
 
-        # Zaplanuj kolejne odświeżenie GUI
-        self.root.after(500, self.update_gui)
+        if new_alerts:
+            # Mamy nowe powiadomienie! Wymuszamy okno na wierzch
+            print("Nowy alert wykryty! Wyciągam okno.")
+            self.force_window_to_front()
 
-    def send_close_signal(self):
-        # Wysyłamy żądanie w osobny sposób, żeby nie blokować przycisku
+        # Aktualizujemy listę znanych alertów, żeby nie wyskakiwało w kółko dla tego samego
+        self.seen_alert_ids = current_ids
+
+        # 3. Rysowanie interfejsu (Alerty vs Ekran Czuwania)
+        if len(self.active_alerts) > 0:
+            # Mamy alerty - chowamy ekran czuwania, pokazujemy listę
+            self.idle_frame.pack_forget()
+            self.alerts_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # Odświeżamy listę kafelków
+            self.refresh_alerts_list()
+        else:
+            # Brak alertów - chowamy listę, pokazujemy ekran czuwania
+            self.alerts_container.pack_forget()
+            self.idle_frame.pack(fill=tk.BOTH, expand=True)
+
+            # WAŻNE: Nie robimy tutaj self.root.withdraw(), więc okno zostaje widoczne!
+
+        self.root.after(1000, self.update_gui)
+
+    def force_window_to_front(self):
+        """Wymusza pojawienie się okna na wierzchu pulpitu"""
+        self.root.deiconify()  # Jeśli było zminimalizowane -> przywróć
+        self.root.lift()  # Wyciągnij warstwę okna nad inne
+        self.root.attributes("-topmost", True)  # Ustaw "Zawsze na wierzchu"
+        # Opcjonalnie: zdejmij "Zawsze na wierzchu" po chwili, żeby nie blokować komputera
+        # self.root.after(1000, lambda: self.root.attributes("-topmost", False))
+
+    def refresh_alerts_list(self):
+        # Usuwamy stare widgety
+        for widget in self.alerts_container.winfo_children():
+            widget.destroy()
+
+        # Rysujemy nowe
+        for alert in self.active_alerts:
+            self.create_alert_widget(alert)
+
+    def create_alert_widget(self, alert_data):
+        frame = tk.Frame(self.alerts_container, bg="white", bd=2, relief=tk.RAISED)
+        frame.pack(fill=tk.X, pady=5)
+
+        info_frame = tk.Frame(frame, bg="white")
+        info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        tk.Label(info_frame, text=alert_data['message'], font=("Arial", 12, "bold"),
+                 bg="white", fg="red", anchor="w").pack(fill=tk.X)
+
+        details = f"Od: {alert_data['caller']} | Źródło: {alert_data['source']}"
+        tk.Label(info_frame, text=details, font=("Arial", 9),
+                 bg="white", fg="#555", anchor="w").pack(fill=tk.X)
+
+        btn = tk.Button(frame, text="✖ Zamknij", bg="#ffcccc",
+                        command=lambda alert_id=alert_data['id']: self.send_close_signal(alert_id))
+        btn.pack(side=tk.RIGHT, padx=10, fill=tk.Y)
+
+    def send_close_signal(self, alert_id):
         def _req():
             try:
-                requests.post(f"{API_URL}/close", timeout=2)
-            except:
-                pass  # Błąd obsłuży pętla główna
+                payload = {"alert_id": alert_id}
+                requests.post(f"{API_URL}/close", json=payload, timeout=2)
+            except Exception as e:
+                print(f"Błąd zamykania: {e}")
 
         threading.Thread(target=_req, daemon=True).start()
 

@@ -1,37 +1,77 @@
+import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from contextlib import asynccontextmanager
 from bson import ObjectId
-from typing import List
-from config import MongoCredentials
+from typing import List, Optional
 
-# KONFIGURACJA MONGO
-client = AsyncIOMotorClient(MongoCredentials.MONGODB_URL)
-sync_db = client[MongoCredentials.DATABASE_NAME]
-# Używamy tej samej kolekcji, ale teraz będziemy w niej trzymać wiele dokumentów
-collection = sync_db[MongoCredentials.COLLECTION_NAME]
+# Próba importu konfigu, ale z fallbackiem (żeby nie wywalało błędu jak brakuje pliku na serwerze)
+try:
+    from config import MongoCredentials
+
+    mongo_url = MongoCredentials.MONGODB_URL
+    db_name = MongoCredentials.DATABASE_NAME
+    collection_name = MongoCredentials.COLLECTION_NAME
+except ImportError:
+    # Wartości domyślne lub pobierane ze zmiennych środowiskowych (bezpieczniejsze na produkcji)
+    mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    db_name = os.getenv("DATABASE_NAME", "system_powiadomien")
+    collection_name = os.getenv("COLLECTION_NAME", "alerts")
+
+# Zmienne globalne dla klienta bazy
+client: Optional[AsyncIOMotorClient] = None
+collection = None
 
 
-# --- LIFESPAN ---
+# --- LIFESPAN (Zarządzanie życiem aplikacji) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Przy starcie możemy np. wyczyścić stare wiszące alerty (opcjonalne)
-    # await collection.delete_many({})
-    print("LOG: Serwer gotowy. Obsługa wielu powiadomień.")
-    yield
+    global client, collection
+
+    print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
+    try:
+        # Inicjalizacja klienta
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[db_name]
+        collection = db[collection_name]
+
+        # Test połączenia (Ping)
+        await client.admin.command('ping')
+        print(f"✅ POŁĄCZONO Z MONGODB: {db_name} -> {collection_name}")
+
+    except Exception as e:
+        print(f"❌ BŁĄD POŁĄCZENIA Z MONGODB: {e}")
+        # Nie przerywamy startu, żeby API mogło zwrócić błąd w /health
+
+    yield  # Tu aplikacja działa
+
     print("LOG: Zamykanie serwera.")
-    client.close()
+    if client:
+        client.close()
 
 
 app = FastAPI(lifespan=lifespan, title="System Powiadomień API")
+
+# --- KONFIGURACJA CORS (Dla dostępu "ze świata") ---
+# Pozwalamy na wszystko (*), bo ma być testowo i publicznie.
+origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- MODELE DANYCH (Pydantic) ---
 
 class AlertSchema(BaseModel):
-    id: str  # Przekonwertowane z ObjectId
+    id: str
     caller: str
     source: str
     message: str
@@ -41,6 +81,7 @@ class AlertSchema(BaseModel):
 class StatusResponse(BaseModel):
     count: int
     alerts: List[AlertSchema]
+    status: str = "ok"  # Dodatkowe pole statusu
 
 
 class TriggerRequest(BaseModel):
@@ -55,7 +96,6 @@ class CloseRequest(BaseModel):
 
 # --- POMOCNIKI ---
 def map_alert(alert):
-    """Pomocnik do konwersji obiektu Mongo na format JSON"""
     return {
         "id": str(alert["_id"]),
         "caller": alert.get("caller", "Nieznany"),
@@ -65,19 +105,49 @@ def map_alert(alert):
     }
 
 
-# --- ENDPOINTY ---
+# --- ENDPOINTY DIAGNOSTYCZNE ---
+
+@app.get("/")
+async def root():
+    """Strona startowa - szybki test czy serwer działa."""
+    return {
+        "message": "System Powiadomień API działa!",
+        "docs_url": "/docs",
+        "redoc_url": "/redoc"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Sprawdza stan bazy danych."""
+    db_status = "disconnected"
+    if client:
+        try:
+            await client.admin.command('ping')
+            db_status = "connected"
+        except Exception as e:
+            db_status = f"error: {str(e)}"
+
+    return {
+        "status": "active",
+        "database": db_status,
+        "timestamp": datetime.now()
+    }
+
+
+# --- ENDPOINTY LOGIKI BIZNESOWEJ ---
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
-    """Pobiera listę aktywnych alertów (max 5 najnowszych)."""
-    # Pobieramy wszystkie dokumenty, sortujemy od najnowszego
+    if collection is None:
+        raise HTTPException(status_code=503, detail="Brak połączenia z bazą danych")
+
     cursor = collection.find().sort("last_updated", -1).limit(5)
     alerts_docs = await cursor.to_list(length=5)
-
-    # Mapujemy na format wyjściowy
     mapped_alerts = [map_alert(doc) for doc in alerts_docs]
 
     return {
+        "status": "ok",
         "count": len(mapped_alerts),
         "alerts": mapped_alerts
     }
@@ -85,11 +155,14 @@ async def get_status():
 
 @app.post("/trigger")
 async def trigger_alert(req: TriggerRequest):
-    """Dodaje nowy alert do listy."""
-    # Opcjonalnie: Zabezpieczenie przed spamem (max 5 aktywnych)
+    if collection is None:
+        raise HTTPException(status_code=503, detail="Brak połączenia z bazą danych")
+
     count = await collection.count_documents({})
     if count >= 5:
-        return {"result": "error", "message": "Osiągnięto limit 5 powiadomień. Zamknij stare."}
+        # Zamiast błędu, usuń najstarszy (opcja FIFO), żeby system się nie zatykał
+        # Lub zostaw return error, jeśli wolisz manualne czyszczenie
+        return {"result": "error", "message": "Limit 5 powiadomień. Zamknij stare."}
 
     new_alert = {
         "status": "active",
@@ -105,7 +178,9 @@ async def trigger_alert(req: TriggerRequest):
 
 @app.post("/close")
 async def close_alert(req: CloseRequest):
-    """Usuwa KONKRETNY alert na podstawie ID."""
+    if collection is None:
+        raise HTTPException(status_code=503, detail="Brak połączenia z bazą danych")
+
     try:
         obj_id = ObjectId(req.alert_id)
         result = await collection.delete_one({"_id": obj_id})
@@ -121,4 +196,7 @@ async def close_alert(req: CloseRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8020)
+    # Pobieramy port z env lub domyślnie 8020
+    # Host 0.0.0.0 jest KLUCZOWY dla dostępu z sieci
+    port = int(os.getenv("PORT", 8020))
+    uvicorn.run(app, host="0.0.0.0", port=port)
