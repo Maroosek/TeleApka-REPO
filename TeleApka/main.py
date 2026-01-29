@@ -1,12 +1,12 @@
 import tkinter as tk
+from tkinter import messagebox
 import requests
 import threading
 import time
 
 # Konfiguracja
-API_URL_SECONDARY = "http://192.168.10.111:8020"  # Lokalne (Domyślne)
-API_URL_PRIMARY = "http://64.225.111.62:8020"  # Zapasowe (Świat)
-POLL_INTERVAL = 2
+API_URL = "http://64.225.111.62:8020"  # Główny adres API
+POLL_INTERVAL = 1
 
 
 class AlertClient:
@@ -15,24 +15,55 @@ class AlertClient:
         self.root.title("Monitor Połączeń - Telestrada")
         self.root.geometry("500x450")
 
+        # Przechwycenie sygnału zamknięcia okna ("X")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         # Stan
-        self.current_api_url = API_URL_PRIMARY  # Zaczynamy od głównego
         self.api_connected = True
         self.active_alerts = []
         self.seen_alert_ids = set()
 
         # --- GUI ---
-        # 1. Pasek statusu
-        self.status_bar = tk.Label(root, text="Uruchamianie...", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 2. Ekran oczekiwania
+        # 1. DOLNY PASEK (Kontener na status i przycisk)
+        # Tworzymy ramkę na samym dole
+        self.bottom_bar = tk.Frame(root, bd=1, relief=tk.SUNKEN)
+        self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # A. Etykieta statusu (po lewej stronie paska)
+        self.status_label = tk.Label(self.bottom_bar, text="Uruchamianie...", anchor=tk.W)
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        # B. Przycisk Pomocy (po prawej stronie paska, mały)
+        self.help_btn = tk.Button(self.bottom_bar, text="?", font=("Arial", 8, "bold"),
+                                  bg="#e0e0e0", width=3, bd=1,
+                                  command=self.show_help_window)
+        self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
+
+        # 2. Ekran oczekiwania (gdy brak alertów)
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
         tk.Label(self.idle_frame, text="System czuwa.\nOczekiwanie na połączenia...",
                  font=("Arial", 14), fg="#888888", bg="#f0f0f0").pack(expand=True)
 
-        # 3. Kontener na alerty
-        self.alerts_container = tk.Frame(root, bg="#ffffff")
+        # 3. Kontener na alerty z Paskiem Przewijania
+        self.canvas_frame = tk.Frame(root, bg="#ffffff")
+
+        self.canvas = tk.Canvas(self.canvas_frame, bg="#ffffff", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(self.canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="#ffffff")
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
 
         # Wątek sieciowy
         self.thread = threading.Thread(target=self.network_loop, daemon=True)
@@ -41,70 +72,91 @@ class AlertClient:
         # Odświeżanie GUI
         self.root.after(500, self.update_gui)
 
+    def on_closing(self):
+        if messagebox.askyesno("Zamykanie",
+                               "Wyłączysz aplikację i przestaniesz otrzymywać powiadomienia.\nCzy kontynuować?"):
+            self.root.destroy()
+
+    def show_help_window(self):
+        """Wyświetla okno z legendą i opisem"""
+        help_win = tk.Toplevel(self.root)
+        help_win.title("Pomoc / Legenda")
+        help_win.geometry("400x350")
+        help_win.resizable(False, False)
+        help_win.attributes("-topmost", True)
+
+        tk.Label(help_win, text="O Aplikacji", font=("Arial", 12, "bold")).pack(pady=(10, 5))
+        desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
+                "Gdy klient dzwoni na infolinię, okno wyskakuje na wierzch,\n"
+                "pokazując kto dzwoni i jaki temat (menu) wybrał.\n"
+                "W przypadku ucinania nazw proszę poszerzyć okno.\n"
+                "Napotkane błędy proszę kierować do działu IT."
+                )
+        tk.Label(help_win, text=desc, justify="center").pack(pady=5)
+
+        tk.Frame(help_win, height=2, bd=1, relief=tk.SUNKEN).pack(fill=tk.X, padx=20, pady=10)
+
+        tk.Label(help_win, text="Legenda Kolorów", font=("Arial", 12, "bold")).pack(pady=(5, 10))
+
+        legend_frame = tk.Frame(help_win)
+        legend_frame.pack(fill=tk.X, padx=40)
+
+        def add_legend_row(color, text):
+            row = tk.Frame(legend_frame, pady=3)
+            row.pack(fill=tk.X)
+            tk.Frame(row, bg=color, width=20, height=20).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(row, text=text, font=("Arial", 10)).pack(side=tk.LEFT)
+
+        add_legend_row("#007bff", "Niebieski - Połączenie przychodzące / Dzwoni")
+        add_legend_row("#28a745", "Zielony - Połączenie odebrane (Rozmowa trwa)")
+        add_legend_row("#dc3545", "Czerwony - Zajęte / Rozłączono")
+
+        tk.Button(help_win, text="Zamknij", command=help_win.destroy, width=15).pack(side=tk.BOTTOM, pady=20)
+
+    def on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        if self.canvas_frame.winfo_ismapped():
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     def network_loop(self):
         while True:
             try:
-                # Używamy self.current_api_url
-                response = requests.get(f"{self.current_api_url}/status", timeout=2)
+                response = requests.get(f"{API_URL}/status", timeout=2)
                 data = response.json()
 
                 self.api_connected = True
                 self.active_alerts = data.get("alerts", [])
 
-                # Debug w konsoli
-                # print(f"Połączono z {self.current_api_url}. Aktywne: {len(self.active_alerts)}")
-
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                print(f"⚠️ Błąd połączenia z {self.current_api_url}: {e}")
-                self.api_connected = False
-
-                # --- LOGIKA PRZEŁĄCZANIA (FAILOVER) ---
-                if self.current_api_url == API_URL_PRIMARY:
-                    print(f"🔄 Przełączam na zapasowe API: {API_URL_SECONDARY}")
-                    self.current_api_url = API_URL_SECONDARY
-                else:
-                    print(f"🔄 Przełączam (powrót) na główne API: {API_URL_PRIMARY}")
-                    self.current_api_url = API_URL_PRIMARY
-
-                # Opcjonalnie: Możemy spróbować natychmiast połączyć się z nowym URL
-                # w tej samej pętli, ale bezpieczniej poczekać do następnego cyklu (za 2s).
-
             except Exception as e:
-                print(f"Inny błąd API: {e}")
+                # print(f"Błąd API: {e}")
                 self.api_connected = False
 
             time.sleep(POLL_INTERVAL)
 
     def update_gui(self):
-        # Określenie, z którego API korzystamy (do wyświetlania)
-        source_name = "PRI" if self.current_api_url == API_URL_PRIMARY else "SEC"
-        source_color = "#dddddd" if source_name == "PRI" else "#ffeebb"  # Żółty dla backupu
-
-        # 1. Obsługa paska statusu
+        # UWAGA: Teraz aktualizujemy self.status_label, a nie self.status_bar
         if not self.api_connected:
-            self.status_bar.config(text=f"⚠ BRAK POŁĄCZENIA ({source_name}) - Próba łączenia...", bg="orange")
+            self.status_label.config(text="⚠ Błąd połączenia, upewnij się że Internet działa", fg="red")
         else:
-            self.status_bar.config(
-                text=f"Połączono [{source_name}]. Trwające rozmowy: {len(self.active_alerts)}",
-                bg=source_color
+            self.status_label.config(
+                text=f"Połączono. Trwające rozmowy: {len(self.active_alerts)}",
+                fg="black"
             )
 
-        # 2. Logika "Wyskakiwania" okna
         current_ids = {alert['id'] for alert in self.active_alerts}
         new_alerts = current_ids - self.seen_alert_ids
-
         if new_alerts:
             self.force_window_to_front()
-
         self.seen_alert_ids = current_ids
 
-        # 3. Rysowanie interfejsu
         if len(self.active_alerts) > 0:
             self.idle_frame.pack_forget()
-            self.alerts_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            self.canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
             self.refresh_alerts_list()
         else:
-            self.alerts_container.pack_forget()
+            self.canvas_frame.pack_forget()
             self.idle_frame.pack(fill=tk.BOTH, expand=True)
 
         self.root.after(1000, self.update_gui)
@@ -115,13 +167,14 @@ class AlertClient:
         self.root.attributes("-topmost", True)
 
     def refresh_alerts_list(self):
-        for widget in self.alerts_container.winfo_children():
+        for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
+
         for alert in self.active_alerts:
             self.create_alert_widget(alert)
 
     def create_alert_widget(self, alert_data):
-        frame = tk.Frame(self.alerts_container, bg="white", bd=2, relief=tk.GROOVE)
+        frame = tk.Frame(self.scrollable_frame, bg="white", bd=2, relief=tk.GROOVE)
         frame.pack(fill=tk.X, pady=4)
 
         caller = alert_data.get('caller', 'Nieznany')
@@ -144,12 +197,12 @@ class AlertClient:
         tk.Label(content_frame, text=f"📞 {caller} ➔ {target}",
                  font=("Arial", 14, "bold"), bg="white", fg="#333").pack(anchor="w")
 
-        details_text = f"Status: {status}"
         if menu:
-            details_text += f"  |  📂 Menu: {menu}"
+            tk.Label(content_frame, text=f"📂 {menu}",
+                     font=("Arial", 12, "bold"), bg="white", fg="#0056b3").pack(anchor="w", pady=(2, 0))
 
-        tk.Label(content_frame, text=details_text,
-                 font=("Arial", 10), bg="white", fg="#666").pack(anchor="w")
+        tk.Label(content_frame, text=f"Status: {status}",
+                 font=("Arial", 8), bg="white", fg="#aaaaaa").pack(anchor="e", pady=(5, 0))
 
 
 if __name__ == "__main__":
