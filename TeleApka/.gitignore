@@ -1,0 +1,29 @@
+# --- Pliki systemowe i IDE ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Pliki tymczasowe Pythona (Dla obu projektów) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Środowiska wirtualne (gdziekolwiek by nie były) ---
+venv/
+.venv/
+env/
+Scripts/
+
+# === KONFIGURACJA DLA: TeleApka API ===
+# Ignorowanie pliku z hasłami do bazy
+TeleApka API/config.py
+
+# === KONFIGURACJA DLA: TeleApka (Klient) ===
+# Folder budowania aplikacji (PyInstaller)
+build/
+dist/
+*.spec
+
+# --- Opcjonalnie: Logi ---
+*.log
