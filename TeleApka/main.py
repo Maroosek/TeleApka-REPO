@@ -1,13 +1,15 @@
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import ttk  # <--- DODANO: Do obsługi tabeli (Treeview)
 import requests
 import threading
 import time
 import copy
+from datetime import datetime
 
 # Konfiguracja
-API_URL = "http://192.168.18.8:8020"
-#API_URL = "http://64.225.111.62:8020"
+#API_URL = "http://192.168.18.8:8020"
+API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 1
 Token = "admin123"
 
@@ -16,7 +18,7 @@ class LoginWindow(tk.Toplevel):
     def __init__(self, parent, on_login_success):
         super().__init__(parent)
         self.on_login_success = on_login_success
-        self.title("Logowanie - Monitor JET")
+        self.title("Logowanie - Monitor połączeń JET")
         self.geometry("300x200")
         self.resizable(False, False)
 
@@ -33,11 +35,6 @@ class LoginWindow(tk.Toplevel):
         self.entry_user = tk.Entry(self)
         self.entry_user.pack(pady=2)
 
-        # tk.Label(self, text="Kod (Token):").pack(pady=2)
-        # self.entry_token = tk.Entry(self, show="*")
-        # self.entry_token.pack(pady=2)
-
-
         self.btn_login = tk.Button(self, text="Wejdź", bg="#007bff", fg="white",
                                    width=15, command=self.attempt_login)
         self.btn_login.pack(pady=15)
@@ -47,11 +44,10 @@ class LoginWindow(tk.Toplevel):
 
     def attempt_login(self):
         username = self.entry_user.get().strip()
-        # token = self.entry_token.get().strip()
         token = Token
 
         if not username or not token:
-            messagebox.showwarning("Błąd", "Podaj login i kod.")
+            messagebox.showwarning("Błąd", "Podaj prawidłowy login")
             return
 
         try:
@@ -62,7 +58,6 @@ class LoginWindow(tk.Toplevel):
                 data = response.json()
                 print(f"LOGIN SUCCESSFUL: {data}")
                 self.destroy()
-                # Przekazujemy wszystkie dane: user, czy_admin, przypisany_ag
                 self.on_login_success(
                     data.get("username"),
                     data.get("is_admin", False),
@@ -86,10 +81,10 @@ class AlertClient:
         self.root = root
         self.username = username
         self.is_admin = is_admin
-        self.assigned_ag = assigned_ag  # Przechowujemy przypisany numer/kolejkę
+        self.assigned_ag = assigned_ag
 
         role_info = "ADMIN" if self.is_admin else f"Stanowisko: {self.assigned_ag or 'Brak'}"
-        self.root.title(f"Monitor JET - {self.username} [{role_info}]")
+        self.root.title(f"Monitor połączeń JET - {self.username} [{role_info}]")
 
         try:
             img = tk.PhotoImage(file="app.png")
@@ -119,11 +114,18 @@ class AlertClient:
         self.help_btn = tk.Button(self.bottom_bar, text="?", font=("Arial", 8, "bold"),
                                   bg="#e0e0e0", width=3, bd=1,
                                   command=self.show_help_window)
+
         self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
+
+        # --- ZMIANA: PRZYCISK HISTORIA ---
+        if self.is_admin:
+            self.history_btn = tk.Button(self.bottom_bar, text="Historia", font=("Arial", 8, "bold"),
+                                         bg="#e0e0e0", width=8, bd=1,
+                                         command=self.show_history_window)  # Zmieniono command
+            self.history_btn.pack(side=tk.LEFT, padx=2, pady=1)
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
 
-        # Wyświetlamy informację, na co system czeka
         wait_msg = "System czuwa."
         if not self.is_admin and self.assigned_ag:
             wait_msg += f"\nOczekiwanie na połączenia dla: {self.assigned_ag}"
@@ -160,17 +162,227 @@ class AlertClient:
         if messagebox.askyesno("Zamykanie", "Czy na pewno chcesz zamknąć monitor połączeń?"):
             self.root.destroy()
 
+    def show_history_window(self):
+        hist_win = tk.Toplevel(self.root)
+        hist_win.title("Historia Połączeń (Ostatnie 50)")
+        hist_win.geometry("700x450")
+
+        # Stylizacja i definicja kolorów
+        style = ttk.Style()
+        style.configure("Treeview", font=("Arial", 10), rowheight=25)
+
+        tree_frame = tk.Frame(hist_win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        columns = ("phone", "date", "timediff", "menu")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+
+        # --- KONFIGURACJA KOLORÓW ---
+        tree.tag_configure("normal", foreground="black")  # Powyżej godziny (czarny)
+        tree.tag_configure("green", foreground="#28a745", font=("Arial", 10, "bold"))  # < 15 min (zielony)
+        tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))  # 15-30 min
+        tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))  # 30-60 min
+
+        tree.heading("phone", text="Numer Telefonu")
+        tree.heading("date", text="Ostatnie Połączenie")
+        tree.heading("timediff", text="Różnica")
+        tree.heading("menu", text="Źródło / Menu")
+
+        tree.column("phone", width=120, anchor=tk.CENTER)
+        tree.column("date", width=130, anchor=tk.CENTER)
+        tree.column("timediff", width=90, anchor=tk.CENTER)
+        tree.column("menu", width=250, anchor=tk.W)
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def fetch_data():
+            if not hist_win.winfo_exists():
+                return
+
+            try:
+                response = requests.get(f"{API_URL}/history?limit=50", timeout=3)
+                if response.status_code == 200:
+                    # Czyścimy stare dane
+                    for item in tree.get_children():
+                        tree.delete(item)
+
+                    logs = response.json().get("logs", [])
+                    now = datetime.now()
+
+                    for log in reversed(logs):
+                        raw_phone = log.get("phone_number", "")
+                        fmt_phone = self.format_phone_number(raw_phone)
+                        raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
+
+                        try:
+                            call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
+                            diff = now - call_time
+                            diff_minutes = diff.total_seconds() / 60
+
+                            # Formatuje różnicę czasu
+                            fmt_timediff = str(diff).split(".")[0]
+
+                            # --- NOWA LOGIKA KOLORÓW ---
+                            if diff_minutes < 15:
+                                row_tag = "green"  # Poniżej 15 min na zielono
+                            elif diff_minutes < 30:
+                                row_tag = "orange"
+                            elif diff_minutes < 60:
+                                row_tag = "red"
+                            else:
+                                row_tag = "normal"  # Powyżej godziny na czarno (bez mrugania)
+
+                            tree.insert("", tk.END,
+                                        values=(fmt_phone, raw_date, fmt_timediff, log.get("last_menu_full", "-")),
+                                        tags=(row_tag,))
+                        except:
+                            tree.insert("", tk.END, values=(fmt_phone, raw_date, "???", log.get("last_menu_full", "-")))
+
+            except Exception as e:
+                print(f"Błąd pobierania historii: {e}")
+
+            # Ponowne wywołanie pobierania za 60 sekund
+            hist_win.after(60000, fetch_data)
+
+        # Uruchomienie pobierania danych (bez funkcji mrugania, bo została usunięta)
+        fetch_data()
+
+        tk.Button(hist_win, text="Zamknij", command=hist_win.destroy, bg="#f0f0f0").pack(pady=5)
+
+    # # --- NOWA METODA: OKNO HISTORII ---
+    # def show_history_window(self):
+    #     hist_win = tk.Toplevel(self.root)
+    #     hist_win.title("Historia Połączeń (Ostatnie 50)")
+    #     hist_win.geometry("700x450")
+    #
+    #     # Stan mrugania
+    #     hist_win.blink_state = True
+    #
+    #     # Stylizacja i definicja kolorów
+    #     style = ttk.Style()
+    #     style.configure("Treeview", font=("Arial", 10), rowheight=25)
+    #
+    #     # Definiujemy tagi dla kolorów (tło i tekst)
+    #     tree_frame = tk.Frame(hist_win)
+    #     tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    #
+    #     columns = ("phone", "date", "timediff", "menu")
+    #     tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+    #
+    #     # Konfiguracja tagów (kolorów)
+    #     tree.tag_configure("normal", foreground="black")
+    #     tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))
+    #     tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))
+    #     tree.tag_configure("blink_on", foreground="white", background="red")
+    #     tree.tag_configure("blink_off", foreground="red", background="white")
+    #
+    #     tree.heading("phone", text="Numer Telefonu")
+    #     tree.heading("date", text="Ostatnie Połączenie")
+    #     tree.heading("timediff", text="Różnica")
+    #     tree.heading("menu", text="Źródło / Menu")
+    #
+    #     tree.column("phone", width=120, anchor=tk.CENTER)
+    #     tree.column("date", width=130, anchor=tk.CENTER)
+    #     tree.column("timediff", width=90, anchor=tk.CENTER)
+    #     tree.column("menu", width=250, anchor=tk.W)
+    #
+    #     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    #
+    #     scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    #     tree.configure(yscrollcommand=scroll.set)
+    #     scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    #
+    #     def fetch_data():
+    #         if not hist_win.winfo_exists():
+    #             return
+    #
+    #         try:
+    #             response = requests.get(f"{API_URL}/history?limit=50", timeout=3)
+    #             if response.status_code == 200:
+    #                 # Czyścimy stare dane
+    #                 for item in tree.get_children():
+    #                     tree.delete(item)
+    #
+    #                 logs = response.json().get("logs", [])
+    #                 now = datetime.now()
+    #
+    #                 for log in reversed(logs):
+    #                     raw_phone = log.get("phone_number", "")
+    #                     fmt_phone = self.format_phone_number(raw_phone)
+    #                     raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
+    #
+    #                     try:
+    #                         call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
+    #                         diff = now - call_time
+    #                         diff_minutes = diff.total_seconds() / 60
+    #
+    #                         # Formatuje różnicę czasu
+    #                         fmt_timediff = str(diff).split(".")[0]
+    #
+    #                         # Wybór tagu na podstawie czasu
+    #                         row_tag = "normal"
+    #                         if diff_minutes >= 60:
+    #                             row_tag = "blink_on" if hist_win.blink_state else "blink_off"
+    #                         elif diff_minutes >= 30:
+    #                             row_tag = "red"
+    #                         elif diff_minutes >= 15:
+    #                             row_tag = "orange"
+    #
+    #                         tree.insert("", tk.END,
+    #                                     values=(fmt_phone, raw_date, fmt_timediff, log.get("last_menu_full", "-")),
+    #                                     tags=(row_tag,))
+    #                     except:
+    #                         tree.insert("", tk.END, values=(fmt_phone, raw_date, "???", log.get("last_menu_full", "-")))
+    #
+    #         except Exception as e:
+    #             print(f"Błąd pobierania historii: {e}")
+    #
+    #         # Ponowne wywołanie pobierania za 60 sekund
+    #         hist_win.after(60000, fetch_data)
+    #
+    #     def run_blinking():
+    #         """Funkcja obsługująca mruganie wpisów +1h (szybsza niż pobieranie danych)"""
+    #         if not hist_win.winfo_exists():
+    #             return
+    #
+    #         hist_win.blink_state = not hist_win.blink_state
+    #
+    #         # Przechodzimy po wszystkich wierszach i aktualizujemy tylko te, które mrugają
+    #         for item in tree.get_children():
+    #             tags = tree.item(item, "tags")
+    #             if "blink_on" in tags or "blink_off" in tags:
+    #                 new_tag = "blink_on" if hist_win.blink_state else "blink_off"
+    #                 tree.item(item, tags=(new_tag,))
+    #
+    #         hist_win.after(500, run_blinking)
+    #
+    #     # Uruchomienie procesów
+    #     fetch_data()
+    #     run_blinking()
+    #
+    #     tk.Button(hist_win, text="Zamknij", command=hist_win.destroy, bg="#f0f0f0").pack(pady=5)
+
     def show_help_window(self):
         help_win = tk.Toplevel(self.root)
         help_win.title("Pomoc / Legenda")
-        help_win.geometry("400x350")
+        help_win.geometry("350x400")
         help_win.resizable(False, False)
         help_win.attributes("-topmost", True)
 
         tk.Label(help_win, text="O Aplikacji", font=("Arial", 12, "bold")).pack(pady=(10, 5))
-        desc = "Aplikacja monitoruje system telefoniczny Telestrada."
+        desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
+                "Gdy klient dzwoni na infolinię, okno wyskakuje na wierzch,\n"
+                "pokazując kto dzwoni i jaki temat (menu) wybrał.\n"
+                "W przypadku ucinania nazw proszę poszerzyć okno.\n"
+                "Napotkane błędy proszę kierować do działu IT."
+                )
+
         if not self.is_admin:
-            desc += f"\nWyświetla połączenia skierowane na: {self.assigned_ag or 'Brak'}"
+            desc += f"\n\nWyświetla połączenia skierowane na: {self.assigned_ag or 'Brak'}"
         tk.Label(help_win, text=desc, justify="center").pack(pady=5)
 
         tk.Frame(help_win, height=2, bd=1, relief=tk.SUNKEN).pack(fill=tk.X, padx=20, pady=10)
@@ -199,23 +411,14 @@ class AlertClient:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def filter_alerts(self, all_alerts):
-        """
-        Filtruje alerty.
-        Admin widzi wszystko.
-        Zwykły user widzi tylko to, co ma 'source' zgodne z jego 'assigned_ag'.
-        """
-
-        print(f"FILTERING ALERTS FOR USER: {self.assigned_ag}")
-
         if self.is_admin:
             return all_alerts
 
         if not self.assigned_ag:
-            return []  # User bez przypisanego numeru nie widzi nic
+            return []
 
         filtered = []
         for alert in all_alerts:
-            # Porównujemy jako stringi dla pewności
             if str(alert.get("source")) == str(self.assigned_ag):
                 filtered.append(alert)
         return filtered
@@ -227,10 +430,9 @@ class AlertClient:
                 data = response.json()
                 self.api_connected = True
 
-                print(f"STATUS: {data}")
+                # print(f"STATUS: {data}") # Opcjonalne: wyciszenie spamu w konsoli
 
                 raw_alerts = data.get("alerts", [])
-                # TU FILTRUJEMY ALERT DLA KONKRETNEGO UŻYTKOWNIKA
                 self.active_alerts = self.filter_alerts(raw_alerts)
 
             except Exception:
@@ -246,11 +448,9 @@ class AlertClient:
             msg += f" | Widoczne rozmowy: {len(self.active_alerts)}"
             self.status_label.config(text=msg, fg="black")
 
-        # Sprawdzanie czy pojawiło się COŚ NOWEGO NA LIŚCIE WIDOCZNYCH
         current_ids = {alert['id'] for alert in self.active_alerts}
         new_alerts = current_ids - self.seen_alert_ids
 
-        # Okno wyskakuje tylko jeśli nowy alert dotyczy zalogowanego usera (bo lista jest przefiltrowana)
         if new_alerts:
             self.force_window_to_front()
 
@@ -322,12 +522,10 @@ if __name__ == "__main__":
     root.withdraw()
 
 
-    # Callback przyjmuje teraz 3 argumenty
     def start_main_app(username, is_admin, assigned_ag):
         root.deiconify()
         app = AlertClient(root, username, is_admin, assigned_ag)
 
 
     LoginWindow(root, start_main_app)
-
     root.mainloop()

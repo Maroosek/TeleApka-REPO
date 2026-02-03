@@ -8,9 +8,6 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 from pymongo.errors import DuplicateKeyError
 
-# --- KONFIGURACJA LOGOWANIA ---
-GLOBAL_ACCESS_TOKEN = "admin123"
-
 # Próba importu konfigu
 try:
     from config import MongoCredentials
@@ -18,38 +15,54 @@ try:
     db_name = MongoCredentials.DATABASE_NAME
     collection_name = MongoCredentials.COLLECTION_NAME
     collection_users_name = MongoCredentials.COLLECTION_USERS
+    collection_logs_name = MongoCredentials.COLLECTION_HISTORY
+    GLOBAL_ACCESS_TOKEN = MongoCredentials.GLOBAL_ACCESS_TOKEN
     port = int(os.getenv("PORT", 8020))
 except ImportError:
     mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     db_name = os.getenv("DATABASE_NAME", "system_powiadomien")
     collection_name = os.getenv("COLLECTION_NAME", "alerts")
     collection_users_name = os.getenv("COLLECTION_USERS", "user")
+    collection_logs_name = os.getenv("COLLECTION_HISTORY", "history")
+    GLOBAL_ACCESS_TOKEN = os.getenv("GLOBAL_ACCESS_TOKEN", "admin123")
     port = int(os.getenv("PORT", 8020))
 
 # Zmienne globalne
 client: Optional[AsyncIOMotorClient] = None
 collection = None
 collection_users = None
+collection_logs = None
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, collection, collection_users
+    global client, collection, collection_users, collection_logs
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
     try:
         client = AsyncIOMotorClient(mongo_url)
         db = client[db_name]
+
+        # Kolekcja alertów
         collection = db[collection_name]
         await collection.create_index("call_id", unique=True)
+
+        # Kolekcja użytkowników
         collection_users = db[collection_users_name]
         await collection_users.create_index("username", unique=True)
-        print(f"✅ POŁĄCZONO Z MONGODB: {db_name} -> {collection_name} oraz {collection_users_name}")
+
+        # Kolekcja logów (historii numerów z menu)
+        collection_logs = db[collection_logs_name]
+        await collection_logs.create_index("phone_number", unique=True)
+
+        print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
+        print(f"   Kolekcje: {collection_name}, {collection_users_name}, {collection_logs_name}")
     except Exception as e:
         print(f"❌ BŁĄD POŁĄCZENIA Z MONGODB: {e}")
     yield
     print("LOG: Zamykanie serwera.")
     if client:
         client.close()
+
 
 app = FastAPI(lifespan=lifespan, title="System Powiadomień API - Telestrada")
 
@@ -60,6 +73,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- MODELE DANYCH ---
 class AlertSchema(BaseModel):
@@ -73,19 +87,35 @@ class AlertSchema(BaseModel):
     status: Optional[str] = None
     timestamp: datetime
 
+
 class UserCreate(BaseModel):
     username: str
     assigned_ag: Optional[str] = None
     is_admin: bool = False
 
+
 class LoginSchema(BaseModel):
     username: str
     token: str
+
 
 class StatusResponse(BaseModel):
     status: str
     count: int
     alerts: List[AlertSchema]
+
+
+# --- NOWE MODELE DLA HISTORII ---
+class LogEntrySchema(BaseModel):
+    id: str
+    phone_number: str
+    last_call: datetime
+    last_menu_full: Optional[str] = None
+
+class HistoryResponse(BaseModel):
+    count: int
+    logs: List[LogEntrySchema]
+
 
 # --- ENDPOINTY ---
 
@@ -93,12 +123,9 @@ class StatusResponse(BaseModel):
 async def root():
     return {"message": "API Telestrady działa", "docs": "/docs"}
 
-# --- ZMIENIONY ENDPOINT LOGOWANIA ---
+
 @app.post("/login")
 async def login(data: LoginSchema):
-    """
-    Sprawdza token i usera. Zwraca assigned_ag i is_admin.
-    """
     if collection_users is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
@@ -109,21 +136,21 @@ async def login(data: LoginSchema):
     if not user:
         raise HTTPException(status_code=404, detail="Taki użytkownik nie istnieje.")
 
-    # Zwracamy kluczowe dane do filtrowania w kliencie
     return {
         "message": "Zalogowano",
         "username": user["username"],
         "is_admin": user.get("is_admin", False),
-        "assigned_ag": user.get("assigned_ag")  # <--- TO DODANO
+        "assigned_ag": user.get("assigned_ag")
     }
+
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
-    cursor = collection.find().sort("last_updated", -1).limit(10)
-    alerts_docs = await cursor.to_list(length=10)
+    cursor = collection.find().sort("last_updated", -1).limit(25)
+    alerts_docs = await cursor.to_list(length=25)
 
     mapped_alerts = []
     for doc in alerts_docs:
@@ -145,12 +172,45 @@ async def get_status():
         "alerts": mapped_alerts
     }
 
+
+# --- NOWY ENDPOINT: WYŚWIETLANIE LOGÓW ---
+@app.get("/history", response_model=HistoryResponse)
+async def get_history(limit: int = 50):
+    """
+    Pobiera historię logowań numerów z menu.
+    Domyślnie zwraca 50 ostatnich wpisów, posortowanych od najnowszego.
+    """
+    if collection_logs is None:
+        raise HTTPException(status_code=503, detail="Brak bazy danych logów")
+
+    # Pobierz logi, sortuj malejąco po dacie (najnowsze na górze)
+    cursor = collection_logs.find().sort("last_call", -1).limit(limit)
+    logs_docs = await cursor.to_list(length=limit)
+
+    mapped_logs = []
+    for doc in logs_docs:
+        mapped_logs.append({
+            "id": str(doc["_id"]),
+            "phone_number": doc.get("phone_number"),
+            "last_call": doc.get("last_call"),
+            "last_menu_full": doc.get("last_menu_full")
+        })
+
+    return {
+        "count": len(mapped_logs),
+        "logs": mapped_logs
+    }
+
+
 @app.post("/users", status_code=201)
-async def create_user(user: UserCreate):
+async def create_user(user: UserCreate, token: str):
     if collection_users is None:
         raise HTTPException(status_code=503, detail="Brak połączenia z bazą użytkowników")
     user_data = user.dict()
-    #user_data["created_at"] = datetime.now()
+
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
+
     try:
         result = await collection_users.insert_one(user_data)
         return {"message": "Użytkownik dodany", "username": user.username, "id": str(result.inserted_id)}
@@ -158,6 +218,7 @@ async def create_user(user: UserCreate):
         raise HTTPException(status_code=409, detail=f"Użytkownik '{user.username}' już istnieje.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd bazy: {str(e)}")
+
 
 # --- WEBHOOK  ---
 @app.get("/webhook/telestrada")
@@ -172,22 +233,45 @@ async def telestrada_webhook(
 ):
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
+
+    # --- LOGIKA LOGOWANIA NUMERU Z MENU ---
+    if menu and collection_logs is not None:
+        try:
+            target_number = menu.strip()[-9:]
+            if len(target_number) == 9:
+                await collection_logs.update_one(
+                    {"phone_number": target_number},
+                    {
+                        "$set": {
+                            "last_call": datetime.now(),
+                            "last_menu_full": menu
+                        },
+                    },
+                    upsert=True
+                )
+                print(f"💾 Zalogowano połączenie dla numeru z menu: {target_number}")
+        except Exception as e:
+            print(f"❌ Błąd podczas logowania numeru z menu: {e}")
+    # ---------------------------------------------
+
     if not czy_trwa:
         print(f"📞 Koniec połączenia {id} ({status}). Usuwam.")
         await collection.delete_one({"call_id": id})
         return "OK_DELETED"
+
     existing = await collection.find_one({"call_id": id})
     if not existing:
         count = await collection.count_documents({})
-        if count >= 10:
-            print("⚠️ Osiągnięto limit 10 połączeń. Ignoruję nowe.")
+        if count >= 25:
+            print("⚠️ Osiągnięto limit 25 połączeń. Ignoruję nowe.")
             return "LIMIT_REACHED"
+
     caller_num = numer
-    if ag: source_num = ag
-    elif menu: source_num = menu
-    else: source_num = "Infolinia"
+    source_num = ag if ag else (menu if menu else "Infolinia")
+
     display_message = f"{caller_num} ➡️ {source_num}"
     if menu: display_message += f" [{menu}]"
+
     alert_data = {
         "call_id": id,
         "caller": caller_num,
@@ -198,9 +282,11 @@ async def telestrada_webhook(
         "status": status,
         "last_updated": datetime.now()
     }
+
     await collection.update_one({"call_id": id}, {"$set": alert_data}, upsert=True)
     print(f"📞 Aktualizacja połączenia {id}: {caller_num} -> {source_num} (Status: {status})")
     return "OK_UPDATED"
+
 
 if __name__ == "__main__":
     import uvicorn
