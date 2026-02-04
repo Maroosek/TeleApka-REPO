@@ -1,5 +1,5 @@
-import os
-from fastapi import FastAPI, HTTPException, Query
+import os, random, time
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -7,6 +7,12 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from pymongo.errors import DuplicateKeyError
+from urllib.parse import parse_qs
+
+from Bitrix24 import find_owner_by_incoming_sms, add_new_activity
+
+import urllib.request
+import urllib.parse
 
 # Próba importu konfigu
 try:
@@ -16,6 +22,7 @@ try:
     collection_name = MongoCredentials.COLLECTION_NAME
     collection_users_name = MongoCredentials.COLLECTION_USERS
     collection_logs_name = MongoCredentials.COLLECTION_HISTORY
+    collection_sms_name = MongoCredentials.COLLECTION_SMS
     GLOBAL_ACCESS_TOKEN = MongoCredentials.GLOBAL_ACCESS_TOKEN
     port = int(os.getenv("PORT", 8020))
 except ImportError:
@@ -24,6 +31,7 @@ except ImportError:
     collection_name = os.getenv("COLLECTION_NAME", "alerts")
     collection_users_name = os.getenv("COLLECTION_USERS", "user")
     collection_logs_name = os.getenv("COLLECTION_HISTORY", "history")
+    collection_sms_name = os.getenv("COLLECTION_SMS", "smsReceived")
     GLOBAL_ACCESS_TOKEN = os.getenv("GLOBAL_ACCESS_TOKEN", "admin123")
     port = int(os.getenv("PORT", 8020))
 
@@ -32,32 +40,55 @@ client: Optional[AsyncIOMotorClient] = None
 collection = None
 collection_users = None
 collection_logs = None
+collection_sms = None
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, collection, collection_users, collection_logs
+    global client, collection, collection_users, collection_logs, collection_sms
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
+
+    # 1. Najpierw inicjujemy klienta, żeby zmienne nie były None
     try:
         client = AsyncIOMotorClient(mongo_url)
         db = client[db_name]
 
-        # Kolekcja alertów
+        # Przypisujemy kolekcje od razu (nawet jak indeksy się nie udadzą, baza będzie działać)
         collection = db[collection_name]
-        await collection.create_index("call_id", unique=True)
-
-        # Kolekcja użytkowników
         collection_users = db[collection_users_name]
-        await collection_users.create_index("username", unique=True)
-
-        # Kolekcja logów (historii numerów z menu)
         collection_logs = db[collection_logs_name]
-        await collection_logs.create_index("phone_number", unique=True)
+        collection_sms = db[collection_sms_name]
 
         print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
-        print(f"   Kolekcje: {collection_name}, {collection_users_name}, {collection_logs_name}")
+
+        # 2. Tworzenie indeksów w oddzielnych blokach try/except
+        # Dzięki temu błąd w jednej kolekcji nie wyłączy całego API
+
+        try:
+            await collection.create_index("call_id", unique=True)
+        except Exception as e:
+            print(f"⚠️ Nie udało się utworzyć indeksu dla ALERTS: {e}")
+
+        try:
+            await collection_users.create_index("username", unique=True)
+        except Exception as e:
+            print(f"⚠️ Nie udało się utworzyć indeksu dla USERS: {e}")
+
+        try:
+            await collection_logs.create_index("phone_number", unique=True)
+        except Exception as e:
+            print(f"⚠️ Nie udało się utworzyć indeksu dla HISTORY: {e}")
+
+        # try:
+        #     # Tu też unique=True, ale jeśli masz stare duplikaty, to się nie utworzy (ale API wstanie)
+        #     await collection_sms.create_index("_id", unique=True)
+        # except Exception as e:
+        #     print(f"⚠️ Nie udało się utworzyć indeksu dla SMS: {e}")
+
     except Exception as e:
-        print(f"❌ BŁĄD POŁĄCZENIA Z MONGODB: {e}")
+        print(f"❌ KRYTYCZNY BŁĄD POŁĄCZENIA Z BAZĄ: {e}")
+        # Tutaj zmienne mogą zostać None, jeśli padnie samo połączenie z URL
+
     yield
     print("LOG: Zamykanie serwera.")
     if client:
@@ -219,6 +250,69 @@ async def create_user(user: UserCreate, token: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd bazy: {str(e)}")
 
+
+# --- NOWY ENDPOINT: SMS CALLBACK ---
+@app.post("/SMSAPI/addSMS")
+async def add_sms(request: Request):
+    # ... (początek funkcji bez zmian, pobieranie body, parsowanie itp.) ...
+    if collection_sms is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
+        data = parse_qs(body_str)
+
+        def get_val(key):
+            return data.get(key, [None])[0]
+
+        sms_to = get_val("sms_to")
+        sms_from = get_val("sms_from")
+        sms_text = get_val("sms_text")
+        sms_date = get_val("sms_date")
+        username = get_val("username")
+        msg_id_raw = get_val("MsgId")
+
+        # ... (kod zapisujący do Mongo bez zmian) ...
+        # ... (insert_one itd.) ...
+
+        # Zapisano w Mongo, teraz Bitrix:
+
+        print("🔄 Próba dodania aktywności do Bitrix24...")
+
+        try:
+            # ZMIANA 1: Przekazujemy sms_from bezpośrednio, zamiast szukać w bazie
+            bitrixData = find_owner_by_incoming_sms(sms_from)
+
+            # ZMIANA 2: Sprawdzamy czy cokolwiek znaleziono, zanim spróbujemy odczytać dane
+            if bitrixData:
+                Owner_id = bitrixData["OWNER_ID"]  # Pamiętaj o wielkości liter kluczy w słowniku!
+                Owner_type = bitrixData["OWNER_TYPE_ID"]
+                # Używamy znalezionego opiekuna lub domyślnie np. 1 (Admin)
+                Responsible = bitrixData.get("RESPONSIBLE_ID", "1")
+
+                # Opis zadania
+                description = f"[B]SMS od:[/B] {sms_from}\n[B]Treść:[/B]\n{sms_text}"
+
+                add_new_activity(Owner_id, Owner_type, Responsible, description)
+            else:
+                print("ℹ️ Nie dodano aktywności do Bitrix (brak powiązanego Deala/Leada).")
+
+        except Exception as e:
+            # Ten try-except łapie błędy tylko z sekcji Bitrixa, API nie padnie
+            print(f"❌ Błąd integracji Bitrix: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return Response(content="OK", media_type="text/plain")
+
+    except DuplicateKeyError:
+        print(f"⚠️ Duplikat SMS. Ignoruję.")
+        return Response(content="OK", media_type="text/plain")
+
+    except Exception as e:
+        print(f"❌ Błąd ogólny zapisu SMS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- WEBHOOK  ---
 @app.get("/webhook/telestrada")
