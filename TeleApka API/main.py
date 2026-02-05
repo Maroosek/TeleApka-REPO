@@ -8,8 +8,10 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 from pymongo.errors import DuplicateKeyError
 from urllib.parse import parse_qs
+import httpx
 
 from Bitrix24 import find_owner_by_incoming_sms, add_new_activity
+from config import Telestrada
 
 import urllib.request
 import urllib.parse
@@ -203,6 +205,54 @@ async def get_status():
         "alerts": mapped_alerts
     }
 
+# --- NOWY ENDPOINT: POBIERANIE POŁĄCZEŃ Z TELESTRADY ---
+@app.get("/telestrada/connections")
+async def get_telestrada_connections(
+        date: str = Query(..., description="Data w formacie YYYY-MM-DD", example="2026-02-05")):
+    """
+    Pobiera listę połączeń z API Telestrady dla wskazanego dnia.
+    Wymaga uzupełnienia klucza API w pliku config.py w klasie Telestrada.
+    """
+
+    # 1. Pobranie klucza API z Twojego configu
+    # Zakładam, że w pliku config.py w klasie Telestrada dodasz pole API_KEY
+    api_key = getattr(Telestrada, "API_KEY", None)
+
+    # Fallback: jeśli nie ma w klasie, sprawdź zmienną środowiskową lub wpisz ręcznie testowo
+    if not api_key:
+        api_key = os.getenv("TELESTRADA_API_KEY")
+
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Brak skonfigurowanego klucza API Telestrady (Telestrada.API_KEY).")
+
+    # 2. Konfiguracja zapytania
+    url = "https://api.telestrada.pl/api/v1/callcontact/connections"
+
+    headers = {
+        "api-key": api_key,
+        "Accept": "application/json"
+    }
+
+    params = {
+        "date": date  # Format YYYY-MM-DD
+    }
+
+    # 3. Wykonanie asynchronicznego zapytania HTTP
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=headers, params=params, timeout=10.0)
+
+            # Jeśli status code jest inny niż 2xx, rzuć wyjątek
+            response.raise_for_status()
+
+            return response.json()
+
+        except httpx.HTTPStatusError as e:
+            # Obsługa błędów zwróconych przez API Telestrady (np. 401, 403, 404)
+            raise HTTPException(status_code=e.response.status_code, detail=f"Błąd API Telestrady: {e.response.text}")
+        except Exception as e:
+            # Obsługa błędów połączenia
+            raise HTTPException(status_code=500, detail=f"Błąd połączenia z Telestradą: {str(e)}")
 
 # --- NOWY ENDPOINT: WYŚWIETLANIE LOGÓW ---
 @app.get("/history", response_model=HistoryResponse)

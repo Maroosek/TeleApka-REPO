@@ -1,11 +1,14 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from tkinter import ttk
 import requests
 import threading
 import time
 import copy
+import csv
+import re
 from datetime import datetime
+from collections import defaultdict
 
 # Konfiguracja
 # API_URL = "http://192.168.18.8:8020"
@@ -114,14 +117,23 @@ class AlertClient:
         self.help_btn = tk.Button(self.bottom_bar, text="?", font=("Arial", 8, "bold"),
                                   bg="#e0e0e0", width=3, bd=1,
                                   command=self.show_help_window)
-
         self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
 
+        # --- Sekcja przycisków Admina ---
         if self.is_admin:
-            self.history_btn = tk.Button(self.bottom_bar, text="Historia", font=("Arial", 8, "bold"),
+            self.admin_btn_frame = tk.Frame(self.bottom_bar)
+            self.admin_btn_frame.pack(side=tk.LEFT, padx=2, pady=1)
+
+            self.history_btn = tk.Button(self.admin_btn_frame, text="Historia", font=("Arial", 8, "bold"),
                                          bg="#e0e0e0", width=8, bd=1,
                                          command=self.show_history_window)
-            self.history_btn.pack(side=tk.LEFT, padx=2, pady=1)
+            self.history_btn.pack(side=tk.LEFT, padx=1)
+
+            # GUZIK: Wykaz
+            self.report_btn = tk.Button(self.admin_btn_frame, text="Wykaz", font=("Arial", 8, "bold"),
+                                        bg="#d1ecf1", width=8, bd=1,
+                                        command=self.show_report_window)
+            self.report_btn.pack(side=tk.LEFT, padx=1)
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
 
@@ -161,16 +173,247 @@ class AlertClient:
         if messagebox.askyesno("Zamykanie", "Czy na pewno chcesz zamknąć monitor połączeń?"):
             self.root.destroy()
 
+    # --- NOWA FUNKCJA: OKNO WYKAZU (RAPORTU) ---
+    def show_report_window(self):
+        rep_win = tk.Toplevel(self.root)
+        rep_win.title("Wykaz dzienny - Podsumowanie")
+        rep_win.geometry("750x500")
+
+        # Pasek górny
+        top_frame = tk.Frame(rep_win, pady=10, padx=10, bg="#f8f9fa")
+        top_frame.pack(fill=tk.X)
+
+        tk.Label(top_frame, text="Wybierz dzień (YYYY-MM-DD):", bg="#f8f9fa").pack(side=tk.LEFT, padx=5)
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        entry_date = tk.Entry(top_frame, width=12)
+        entry_date.insert(0, today_str)
+        entry_date.pack(side=tk.LEFT, padx=5)
+
+        # Kontener na drzewo wyników
+        tree_frame = tk.Frame(rep_win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        columns = ("firma", "typ", "ilosc")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+
+        tree.heading("firma", text="Firma (Słowo kluczowe)")
+        tree.heading("typ", text="Typ")
+        tree.heading("ilosc", text="Ilość Połączeń")
+
+        tree.column("firma", width=250)
+        tree.column("typ", width=250)
+        tree.column("ilosc", width=100, anchor=tk.CENTER)
+
+        tree.tag_configure("total_row", font=("Arial", 10, "bold"), background="#e8e8e8")
+        tree.tag_configure("normal_row", font=("Arial", 10))
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        status_lbl = tk.Label(rep_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
+        status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Funkcja zapisująca do CSV
+        def save_to_csv():
+            if not tree.get_children():
+                messagebox.showwarning("Brak danych", "Najpierw pobierz dane, aby móc je zapisać.")
+                return
+
+            # Pobranie wybranej daty dla domyślnej nazwy pliku
+            date_str = entry_date.get().strip() or "nieznana-data"
+            default_filename = f"Wykaz połączeń telefonii {date_str}"
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile=default_filename,
+                filetypes=[("Plik CSV", "*.csv"), ("Wszystkie pliki", "*.*")],
+                title="Zapisz raport jako"
+            )
+
+            if not path:
+                return
+
+            try:
+                # Otwieramy plik z kodowaniem utf-8-sig (Excel friendly)
+                with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f, delimiter=';')
+                    writer.writerow(["Firma", "Typ", "Ilość"])  # Nagłówek
+
+                    for child in tree.get_children():
+                        values = tree.item(child)["values"]
+                        writer.writerow(values)
+
+                status_lbl.config(text=f"Zapisano do pliku: {path}", fg="green")
+                messagebox.showinfo("Sukces", "Dane zostały pomyślnie zapisane do pliku CSV.")
+
+            except Exception as e:
+                messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać pliku: {e}")
+
+        def fetch_report():
+            date_val = entry_date.get().strip()
+            if not date_val:
+                messagebox.showwarning("Błąd", "Wpisz datę.")
+                return
+
+            status_lbl.config(text="Pobieranie danych z API...", fg="blue")
+            rep_win.update()
+
+            # Czyścimy widok
+            for item in tree.get_children():
+                tree.delete(item)
+
+            # --- MAPA KOREKT ---
+            NAME_CORRECTIONS = {
+                "polskikominiarz": "polski kominiarz",
+                "liderizolacji": "lider izolacji",
+                "betoniarnia-beton": "betoniarnia beton",
+                "betoniarnia": "betoniarnia.pl",
+                "liderbeton": "lider beton"
+            }
+
+            try:
+                url = f"{API_URL}/telestrada/connections"
+                print(f"DEBUG: Wysyłanie zapytania do: {url}?date={date_val}")
+
+                response = requests.get(url, params={"date": date_val}, timeout=15)
+
+                if response.status_code == 200:
+                    data = response.json()
+
+                    print(f"DEBUG: Otrzymane dane (typu {type(data)}): {str(data)[:200]}...")
+
+                    connections = []
+                    if isinstance(data, list):
+                        connections = data
+                    elif isinstance(data, dict):
+                        if "connections" in data:
+                            connections = data["connections"]
+                        else:
+                            found_list = False
+                            for key, val in data.items():
+                                if isinstance(val, list) and len(val) > 0:
+                                    connections = val
+                                    found_list = True
+                                    break
+                            if not found_list:
+                                connections = list(data.values())
+
+                    if not connections:
+                        status_lbl.config(text="Brak danych (pusta lista) za wybrany dzień.", fg="orange")
+                        return
+
+                    # --- LOGIKA GRUPOWANIA ---
+                    stats = defaultdict(lambda: defaultdict(int))
+                    count_total = 0
+
+                    for conn in connections:
+                        if not isinstance(conn, dict):
+                            continue
+
+                        menu_full = conn.get("element_menu_name") or conn.get("menu_name") or ""
+
+                        if not menu_full:
+                            continue
+
+                        count_total += 1
+                        menu_full = menu_full.strip()
+
+                        # Pobieranie czasu trwania
+                        try:
+                            duration = int(conn.get("billsec", 0))
+                        except (ValueError, TypeError):
+                            duration = 0
+
+                        company_name = ""
+                        type_name = ""
+
+                        # 1. Sprawdzamy czy jest myślnik " - "
+                        if " - " in menu_full:
+                            parts = menu_full.split(" - ", 1)
+                            company_name = parts[0].strip().lower()  # Zmiana na małe litery
+                            type_name = parts[1].strip()
+                        else:
+                            # 2. Brak myślnika -> Ucinamy numer telefonu TYLKO jeśli to faktycznie numer
+                            # Sprawdzamy, czy ostatnie 9 znaków (po usunięciu spacji) to cyfry
+
+                            check_digits = menu_full.replace(" ", "")
+
+                            # Jeśli długość wystarczająca i końcówka to cyfry -> ucinamy
+                            if len(check_digits) >= 9 and check_digits[-9:].isdigit():
+                                company_name = menu_full[:-9].strip().lower()
+                            else:
+                                # Jeśli nie kończy się cyframi (np. "lider beton"), bierzemy całość
+                                company_name = menu_full.strip().lower()
+
+                            ivr_number = conn.get("ivr_phone_number", "brak_ivr")
+                            type_name = f"Inne/Brak - {ivr_number}"
+
+                        # --- KOREKTA NAZW ---
+                        if company_name in NAME_CORRECTIONS:
+                            company_name = NAME_CORRECTIONS[company_name]
+                        # --------------------
+
+                        if not company_name:
+                            company_name = "nieznana firma"
+
+                        # 3. Filtr < 7s
+                        if duration < 7:
+                            type_name = f"{type_name} (Mniej niż 7s)"
+
+                        stats[company_name][type_name] += 1
+                        stats[company_name]["Wszystkie"] += 1
+
+                    # --- WYŚWIETLANIE ---
+                    if count_total == 0:
+                        status_lbl.config(text="Pobrano dane, ale brak nazw menu do analizy.", fg="orange")
+                        return
+
+                    for company in sorted(stats.keys()):
+                        types = stats[company]
+                        # Najpierw szczegółowe
+                        for t_name, count in types.items():
+                            if t_name == "Wszystkie":
+                                continue
+                            tree.insert("", tk.END, values=(company, t_name, count), tags=("normal_row",))
+
+                        # Podsumowanie
+                        total_count = types["Wszystkie"]
+                        tree.insert("", tk.END, values=(company, "Wszystkie", total_count), tags=("total_row",))
+
+                    status_lbl.config(text=f"Sukces: Przeanalizowano {count_total} połączeń.", fg="green")
+
+                else:
+                    status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
+                    print(f"DEBUG ERROR BODY: {response.text}")
+
+            except Exception as e:
+                status_lbl.config(text=f"Błąd krytyczny: {str(e)}", fg="red")
+                print(f"DEBUG EXCEPTION: {e}")
+
+        # Guziki
+        btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white",
+                              command=fetch_report)
+        btn_fetch.pack(side=tk.LEFT, padx=10)
+
+        btn_save = tk.Button(top_frame, text="Zapisz dane (.csv)", bg="#28a745", fg="white",
+                             command=save_to_csv)
+        btn_save.pack(side=tk.LEFT, padx=10)
+
+    # --- KONIEC NOWEJ FUNKCJI ---
+
     def show_history_window(self):
         hist_win = tk.Toplevel(self.root)
         hist_win.title("Historia Połączeń")
         hist_win.geometry("700x500")
 
-        # Stan lokalny okna historii
         showing_all = False
-        self.history_data_cache = []  # Przechowujemy dane, żeby móc je sortować lokalnie
-        current_sort_col = "date"  # Domyślne sortowanie
-        current_sort_reverse = False  # Najnowsze na górze
+        self.history_data_cache = []
+        current_sort_col = "date"
+        current_sort_reverse = False
 
         style = ttk.Style()
         style.configure("Treeview", font=("Arial", 10), rowheight=25)
@@ -186,44 +429,31 @@ class AlertClient:
         tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))
         tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))
 
-        # --- FUNKCJA PRZELICZAJĄCA I WYŚWIETLAJĄCA DANE W TABELI ---
         def refresh_tree_view():
-            # Wyczyść tabelę
             for item in tree.get_children():
                 tree.delete(item)
 
-            # Sortowanie
-            # Jeśli sortujemy po "timediff", to de facto sortujemy po "date" (bo różnica wynika z daty)
             sort_key = current_sort_col
             if sort_key == "timediff":
                 sort_key = "date"
 
-            # Wykonaj sortowanie na liście słowników
-            # Klucze w history_data_cache: 'phone', 'date', 'timediff', 'menu', 'tags'
             try:
                 self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
             except Exception:
-                pass  # Ignoruj błędy sortowania
+                pass
 
-            # Wstaw do tabeli
             for row in self.history_data_cache:
                 tree.insert("", tk.END, values=(row['phone'], row['date'], row['timediff'], row['menu']),
                             tags=row['tags'])
 
-        # --- KLIKNIĘCIE W NAGŁÓWEK (SORTOWANIE) ---
         def on_header_click(col):
             nonlocal current_sort_col, current_sort_reverse
-
-            # Jeśli kliknięto tę samą kolumnę, odwróć kolejność
             if current_sort_col == col:
                 current_sort_reverse = not current_sort_reverse
             else:
                 current_sort_col = col
-                # Domyślny kierunek dla nowej kolumny
-                # Dla daty/czasu chcemy najnowsze (reverse=True), dla tekstu alfabetycznie (reverse=False)
                 current_sort_reverse = True if col in ["date", "timediff"] else False
 
-            # Dodaj strzałkę do nagłówka (wizualny bajer - opcjonalne)
             for c in columns:
                 text = tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
                 tree.heading(c, text=text)
@@ -234,7 +464,6 @@ class AlertClient:
 
             refresh_tree_view()
 
-        # Konfiguracja nagłówków
         tree.heading("phone", text="Numer Telefonu", command=lambda: on_header_click("phone"))
         tree.heading("date", text="Ostatnie Połączenie", command=lambda: on_header_click("date"))
         tree.heading("timediff", text="Różnica", command=lambda: on_header_click("timediff"))
@@ -251,23 +480,17 @@ class AlertClient:
         tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- KLIKNIĘCIE W WIERSZ (KOPIOWANIE) ---
         def on_tree_click(event):
-            # Sprawdź, w co kliknięto
             region = tree.identify_region(event.x, event.y)
             if region != "cell":
                 return
-
-            # Pobierz ID kolumny (np. #1 to pierwsza kolumna danych - phone)
             col_id = tree.identify_column(event.x)
-
-            # Wg definicji columns=("phone", "date", ...), "phone" to kolumna #1
             if col_id == "#1":
                 item_id = tree.identify_row(event.y)
                 if item_id:
                     vals = tree.item(item_id, "values")
                     if vals:
-                        phone_num = vals[0]  # Pierwsza wartość
+                        phone_num = vals[0]
                         self.copy_number(phone_num)
 
         tree.bind("<Button-1>", on_tree_click)
@@ -278,32 +501,25 @@ class AlertClient:
         def fetch_data():
             if not hist_win.winfo_exists():
                 return
-
             try:
                 response = requests.get(f"{API_URL}/history", timeout=5)
                 if response.status_code == 200:
                     logs = response.json().get("logs", [])
                     now = datetime.now()
-
                     new_cache = []
                     count_displayed = 0
-
-                    for log in logs:  # API zwraca posortowane, ale my i tak sortujemy lokalnie
+                    for log in logs:
                         raw_phone = log.get("phone_number", "")
                         fmt_phone = self.format_phone_number(raw_phone)
                         raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
-
                         try:
                             call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
                             diff = now - call_time
                             diff_minutes = diff.total_seconds() / 60
                             diff_hours = diff_minutes / 60
-
                             if not showing_all and diff_hours > 48:
                                 continue
-
                             fmt_timediff = str(diff).split(".")[0]
-
                             row_tag = "normal"
                             if diff_minutes < 15:
                                 row_tag = "green"
@@ -311,8 +527,6 @@ class AlertClient:
                                 row_tag = "orange"
                             elif diff_minutes < 60:
                                 row_tag = "red"
-
-                            # Dodajemy do tymczasowej listy słowników
                             new_cache.append({
                                 'phone': fmt_phone,
                                 'date': raw_date,
@@ -321,7 +535,6 @@ class AlertClient:
                                 'tags': (row_tag,)
                             })
                             count_displayed += 1
-
                         except Exception:
                             if showing_all:
                                 new_cache.append({
@@ -331,15 +544,11 @@ class AlertClient:
                                     'menu': log.get("last_menu_full", "-"),
                                     'tags': ()
                                 })
-
-                    # Aktualizujemy główny cache i odświeżamy widok
                     self.history_data_cache = new_cache
                     refresh_tree_view()
                     hist_win.title(f"Historia Połączeń (Wyświetlono: {count_displayed})")
-
             except Exception as e:
                 print(f"Błąd pobierania historii: {e}")
-
             hist_win.after(60000, fetch_data)
 
         def toggle_view():
@@ -370,7 +579,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n\n"
-                "Wersja 0.6"
+                "Wersja 0.8"
                 )
 
         if not self.is_admin:
