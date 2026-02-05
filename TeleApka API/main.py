@@ -206,17 +206,20 @@ async def get_status():
 
 # --- NOWY ENDPOINT: WYŚWIETLANIE LOGÓW ---
 @app.get("/history", response_model=HistoryResponse)
-async def get_history(limit: int = 50):
+async def get_history():
     """
-    Pobiera historię logowań numerów z menu.
-    Domyślnie zwraca 50 ostatnich wpisów, posortowanych od najnowszego.
+    Pobiera CAŁĄ historię logowań numerów z menu.
+    Zwraca wszystkie wpisy, posortowane od najnowszego.
     """
     if collection_logs is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych logów")
 
-    # Pobierz logi, sortuj malejąco po dacie (najnowsze na górze)
-    cursor = collection_logs.find().sort("last_call", -1).limit(limit)
-    logs_docs = await cursor.to_list(length=limit)
+    # Pobierz logi, sortuj malejąco po dacie.
+    # Usunięto .limit(), aby nie ograniczać wyników po stronie zapytania.
+    cursor = collection_logs.find().sort("last_call", -1)
+
+    # length=None oznacza pobranie wszystkich dokumentów z kursora
+    logs_docs = await cursor.to_list(length=None)
 
     mapped_logs = []
     for doc in logs_docs:

@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import messagebox
-from tkinter import ttk  # <--- DODANO: Do obsługi tabeli (Treeview)
+from tkinter import ttk
 import requests
 import threading
 import time
@@ -8,7 +8,7 @@ import copy
 from datetime import datetime
 
 # Konfiguracja
-#API_URL = "http://192.168.18.8:8020"
+# API_URL = "http://192.168.18.8:8020"
 API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 1
 Token = "admin123"
@@ -117,11 +117,10 @@ class AlertClient:
 
         self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
 
-        # --- ZMIANA: PRZYCISK HISTORIA ---
         if self.is_admin:
             self.history_btn = tk.Button(self.bottom_bar, text="Historia", font=("Arial", 8, "bold"),
                                          bg="#e0e0e0", width=8, bd=1,
-                                         command=self.show_history_window)  # Zmieniono command
+                                         command=self.show_history_window)
             self.history_btn.pack(side=tk.LEFT, padx=2, pady=1)
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
@@ -164,10 +163,15 @@ class AlertClient:
 
     def show_history_window(self):
         hist_win = tk.Toplevel(self.root)
-        hist_win.title("Historia Połączeń (Ostatnie 50)")
-        hist_win.geometry("700x450")
+        hist_win.title("Historia Połączeń")
+        hist_win.geometry("700x500")
 
-        # Stylizacja i definicja kolorów
+        # Stan lokalny okna historii
+        showing_all = False
+        self.history_data_cache = []  # Przechowujemy dane, żeby móc je sortować lokalnie
+        current_sort_col = "date"  # Domyślne sortowanie
+        current_sort_reverse = False  # Najnowsze na górze
+
         style = ttk.Style()
         style.configure("Treeview", font=("Arial", 10), rowheight=25)
 
@@ -177,20 +181,68 @@ class AlertClient:
         columns = ("phone", "date", "timediff", "menu")
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
 
-        # --- KONFIGURACJA KOLORÓW ---
-        tree.tag_configure("normal", foreground="black")  # Powyżej godziny (czarny)
-        tree.tag_configure("green", foreground="#28a745", font=("Arial", 10, "bold"))  # < 15 min (zielony)
-        tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))  # 15-30 min
-        tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))  # 30-60 min
+        tree.tag_configure("normal", foreground="black")
+        tree.tag_configure("green", foreground="#28a745", font=("Arial", 10, "bold"))
+        tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))
+        tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))
 
-        tree.heading("phone", text="Numer Telefonu")
-        tree.heading("date", text="Ostatnie Połączenie")
-        tree.heading("timediff", text="Różnica")
-        tree.heading("menu", text="Źródło / Menu")
+        # --- FUNKCJA PRZELICZAJĄCA I WYŚWIETLAJĄCA DANE W TABELI ---
+        def refresh_tree_view():
+            # Wyczyść tabelę
+            for item in tree.get_children():
+                tree.delete(item)
+
+            # Sortowanie
+            # Jeśli sortujemy po "timediff", to de facto sortujemy po "date" (bo różnica wynika z daty)
+            sort_key = current_sort_col
+            if sort_key == "timediff":
+                sort_key = "date"
+
+            # Wykonaj sortowanie na liście słowników
+            # Klucze w history_data_cache: 'phone', 'date', 'timediff', 'menu', 'tags'
+            try:
+                self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
+            except Exception:
+                pass  # Ignoruj błędy sortowania
+
+            # Wstaw do tabeli
+            for row in self.history_data_cache:
+                tree.insert("", tk.END, values=(row['phone'], row['date'], row['timediff'], row['menu']),
+                            tags=row['tags'])
+
+        # --- KLIKNIĘCIE W NAGŁÓWEK (SORTOWANIE) ---
+        def on_header_click(col):
+            nonlocal current_sort_col, current_sort_reverse
+
+            # Jeśli kliknięto tę samą kolumnę, odwróć kolejność
+            if current_sort_col == col:
+                current_sort_reverse = not current_sort_reverse
+            else:
+                current_sort_col = col
+                # Domyślny kierunek dla nowej kolumny
+                # Dla daty/czasu chcemy najnowsze (reverse=True), dla tekstu alfabetycznie (reverse=False)
+                current_sort_reverse = True if col in ["date", "timediff"] else False
+
+            # Dodaj strzałkę do nagłówka (wizualny bajer - opcjonalne)
+            for c in columns:
+                text = tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
+                tree.heading(c, text=text)
+
+            arrow = " ▼" if current_sort_reverse else " ▲"
+            current_text = tree.heading(col, "text")
+            tree.heading(col, text=current_text + arrow)
+
+            refresh_tree_view()
+
+        # Konfiguracja nagłówków
+        tree.heading("phone", text="Numer Telefonu", command=lambda: on_header_click("phone"))
+        tree.heading("date", text="Ostatnie Połączenie", command=lambda: on_header_click("date"))
+        tree.heading("timediff", text="Różnica", command=lambda: on_header_click("timediff"))
+        tree.heading("menu", text="Źródło / Menu", command=lambda: on_header_click("menu"))
 
         tree.column("phone", width=120, anchor=tk.CENTER)
         tree.column("date", width=130, anchor=tk.CENTER)
-        tree.column("timediff", width=90, anchor=tk.CENTER)
+        tree.column("timediff", width=120, anchor=tk.CENTER)
         tree.column("menu", width=250, anchor=tk.W)
 
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -199,21 +251,44 @@ class AlertClient:
         tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # --- KLIKNIĘCIE W WIERSZ (KOPIOWANIE) ---
+        def on_tree_click(event):
+            # Sprawdź, w co kliknięto
+            region = tree.identify_region(event.x, event.y)
+            if region != "cell":
+                return
+
+            # Pobierz ID kolumny (np. #1 to pierwsza kolumna danych - phone)
+            col_id = tree.identify_column(event.x)
+
+            # Wg definicji columns=("phone", "date", ...), "phone" to kolumna #1
+            if col_id == "#1":
+                item_id = tree.identify_row(event.y)
+                if item_id:
+                    vals = tree.item(item_id, "values")
+                    if vals:
+                        phone_num = vals[0]  # Pierwsza wartość
+                        self.copy_number(phone_num)
+
+        tree.bind("<Button-1>", on_tree_click)
+
+        btn_frame = tk.Frame(hist_win)
+        btn_frame.pack(fill=tk.X, pady=5, padx=10)
+
         def fetch_data():
             if not hist_win.winfo_exists():
                 return
 
             try:
-                response = requests.get(f"{API_URL}/history?limit=50", timeout=3)
+                response = requests.get(f"{API_URL}/history", timeout=5)
                 if response.status_code == 200:
-                    # Czyścimy stare dane
-                    for item in tree.get_children():
-                        tree.delete(item)
-
                     logs = response.json().get("logs", [])
                     now = datetime.now()
 
-                    for log in reversed(logs):
+                    new_cache = []
+                    count_displayed = 0
+
+                    for log in logs:  # API zwraca posortowane, ale my i tak sortujemy lokalnie
                         raw_phone = log.get("phone_number", "")
                         fmt_phone = self.format_phone_number(raw_phone)
                         raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
@@ -222,149 +297,67 @@ class AlertClient:
                             call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
                             diff = now - call_time
                             diff_minutes = diff.total_seconds() / 60
+                            diff_hours = diff_minutes / 60
 
-                            # Formatuje różnicę czasu
+                            if not showing_all and diff_hours > 48:
+                                continue
+
                             fmt_timediff = str(diff).split(".")[0]
 
-                            # --- NOWA LOGIKA KOLORÓW ---
+                            row_tag = "normal"
                             if diff_minutes < 15:
-                                row_tag = "green"  # Poniżej 15 min na zielono
+                                row_tag = "green"
                             elif diff_minutes < 30:
                                 row_tag = "orange"
                             elif diff_minutes < 60:
                                 row_tag = "red"
-                            else:
-                                row_tag = "normal"  # Powyżej godziny na czarno (bez mrugania)
 
-                            tree.insert("", tk.END,
-                                        values=(fmt_phone, raw_date, fmt_timediff, log.get("last_menu_full", "-")),
-                                        tags=(row_tag,))
-                        except:
-                            tree.insert("", tk.END, values=(fmt_phone, raw_date, "???", log.get("last_menu_full", "-")))
+                            # Dodajemy do tymczasowej listy słowników
+                            new_cache.append({
+                                'phone': fmt_phone,
+                                'date': raw_date,
+                                'timediff': fmt_timediff,
+                                'menu': log.get("last_menu_full", "-"),
+                                'tags': (row_tag,)
+                            })
+                            count_displayed += 1
+
+                        except Exception:
+                            if showing_all:
+                                new_cache.append({
+                                    'phone': fmt_phone,
+                                    'date': raw_date,
+                                    'timediff': "???",
+                                    'menu': log.get("last_menu_full", "-"),
+                                    'tags': ()
+                                })
+
+                    # Aktualizujemy główny cache i odświeżamy widok
+                    self.history_data_cache = new_cache
+                    refresh_tree_view()
+                    hist_win.title(f"Historia Połączeń (Wyświetlono: {count_displayed})")
 
             except Exception as e:
                 print(f"Błąd pobierania historii: {e}")
 
-            # Ponowne wywołanie pobierania za 60 sekund
             hist_win.after(60000, fetch_data)
 
-        # Uruchomienie pobierania danych (bez funkcji mrugania, bo została usunięta)
+        def toggle_view():
+            nonlocal showing_all
+            showing_all = not showing_all
+            if showing_all:
+                btn_toggle.config(text="Pokaż tylko < 48h")
+            else:
+                btn_toggle.config(text="Pokaż wszystko")
+            fetch_data()
+
+        btn_toggle = tk.Button(btn_frame, text="Pokaż wszystko", command=toggle_view, bg="#e1e1e1", width=20)
+        btn_toggle.pack(side=tk.LEFT, padx=5)
+
+        tk.Button(btn_frame, text="Zamknij", command=hist_win.destroy, bg="#ffdddd", width=15).pack(side=tk.RIGHT,
+                                                                                                    padx=5)
+
         fetch_data()
-
-        tk.Button(hist_win, text="Zamknij", command=hist_win.destroy, bg="#f0f0f0").pack(pady=5)
-
-    # # --- NOWA METODA: OKNO HISTORII ---
-    # def show_history_window(self):
-    #     hist_win = tk.Toplevel(self.root)
-    #     hist_win.title("Historia Połączeń (Ostatnie 50)")
-    #     hist_win.geometry("700x450")
-    #
-    #     # Stan mrugania
-    #     hist_win.blink_state = True
-    #
-    #     # Stylizacja i definicja kolorów
-    #     style = ttk.Style()
-    #     style.configure("Treeview", font=("Arial", 10), rowheight=25)
-    #
-    #     # Definiujemy tagi dla kolorów (tło i tekst)
-    #     tree_frame = tk.Frame(hist_win)
-    #     tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-    #
-    #     columns = ("phone", "date", "timediff", "menu")
-    #     tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-    #
-    #     # Konfiguracja tagów (kolorów)
-    #     tree.tag_configure("normal", foreground="black")
-    #     tree.tag_configure("orange", foreground="orange", font=("Arial", 10, "bold"))
-    #     tree.tag_configure("red", foreground="red", font=("Arial", 10, "bold"))
-    #     tree.tag_configure("blink_on", foreground="white", background="red")
-    #     tree.tag_configure("blink_off", foreground="red", background="white")
-    #
-    #     tree.heading("phone", text="Numer Telefonu")
-    #     tree.heading("date", text="Ostatnie Połączenie")
-    #     tree.heading("timediff", text="Różnica")
-    #     tree.heading("menu", text="Źródło / Menu")
-    #
-    #     tree.column("phone", width=120, anchor=tk.CENTER)
-    #     tree.column("date", width=130, anchor=tk.CENTER)
-    #     tree.column("timediff", width=90, anchor=tk.CENTER)
-    #     tree.column("menu", width=250, anchor=tk.W)
-    #
-    #     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    #
-    #     scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-    #     tree.configure(yscrollcommand=scroll.set)
-    #     scroll.pack(side=tk.RIGHT, fill=tk.Y)
-    #
-    #     def fetch_data():
-    #         if not hist_win.winfo_exists():
-    #             return
-    #
-    #         try:
-    #             response = requests.get(f"{API_URL}/history?limit=50", timeout=3)
-    #             if response.status_code == 200:
-    #                 # Czyścimy stare dane
-    #                 for item in tree.get_children():
-    #                     tree.delete(item)
-    #
-    #                 logs = response.json().get("logs", [])
-    #                 now = datetime.now()
-    #
-    #                 for log in reversed(logs):
-    #                     raw_phone = log.get("phone_number", "")
-    #                     fmt_phone = self.format_phone_number(raw_phone)
-    #                     raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
-    #
-    #                     try:
-    #                         call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
-    #                         diff = now - call_time
-    #                         diff_minutes = diff.total_seconds() / 60
-    #
-    #                         # Formatuje różnicę czasu
-    #                         fmt_timediff = str(diff).split(".")[0]
-    #
-    #                         # Wybór tagu na podstawie czasu
-    #                         row_tag = "normal"
-    #                         if diff_minutes >= 60:
-    #                             row_tag = "blink_on" if hist_win.blink_state else "blink_off"
-    #                         elif diff_minutes >= 30:
-    #                             row_tag = "red"
-    #                         elif diff_minutes >= 15:
-    #                             row_tag = "orange"
-    #
-    #                         tree.insert("", tk.END,
-    #                                     values=(fmt_phone, raw_date, fmt_timediff, log.get("last_menu_full", "-")),
-    #                                     tags=(row_tag,))
-    #                     except:
-    #                         tree.insert("", tk.END, values=(fmt_phone, raw_date, "???", log.get("last_menu_full", "-")))
-    #
-    #         except Exception as e:
-    #             print(f"Błąd pobierania historii: {e}")
-    #
-    #         # Ponowne wywołanie pobierania za 60 sekund
-    #         hist_win.after(60000, fetch_data)
-    #
-    #     def run_blinking():
-    #         """Funkcja obsługująca mruganie wpisów +1h (szybsza niż pobieranie danych)"""
-    #         if not hist_win.winfo_exists():
-    #             return
-    #
-    #         hist_win.blink_state = not hist_win.blink_state
-    #
-    #         # Przechodzimy po wszystkich wierszach i aktualizujemy tylko te, które mrugają
-    #         for item in tree.get_children():
-    #             tags = tree.item(item, "tags")
-    #             if "blink_on" in tags or "blink_off" in tags:
-    #                 new_tag = "blink_on" if hist_win.blink_state else "blink_off"
-    #                 tree.item(item, tags=(new_tag,))
-    #
-    #         hist_win.after(500, run_blinking)
-    #
-    #     # Uruchomienie procesów
-    #     fetch_data()
-    #     run_blinking()
-    #
-    #     tk.Button(hist_win, text="Zamknij", command=hist_win.destroy, bg="#f0f0f0").pack(pady=5)
 
     def show_help_window(self):
         help_win = tk.Toplevel(self.root)
@@ -375,10 +368,9 @@ class AlertClient:
 
         tk.Label(help_win, text="O Aplikacji", font=("Arial", 12, "bold")).pack(pady=(10, 5))
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
-                "Gdy klient dzwoni na infolinię, okno wyskakuje na wierzch,\n"
-                "pokazując kto dzwoni i jaki temat (menu) wybrał.\n"
-                "W przypadku ucinania nazw proszę poszerzyć okno.\n"
-                "Napotkane błędy proszę kierować do działu IT."
+                "Kliknij numer telefonu, aby go skopiować.\n"
+                "(Działa w oknie głównym i w Historii)\n\n"
+                "Wersja 0.6"
                 )
 
         if not self.is_admin:
@@ -399,7 +391,6 @@ class AlertClient:
 
         add_legend_row("#007bff", "Niebieski - Dzwoni")
         add_legend_row("#28a745", "Zielony - Odebrane")
-        add_legend_row("#dc3545", "Czerwony - Zajęte / Rozłączono")
 
         tk.Button(help_win, text="Zamknij", command=help_win.destroy, width=15).pack(side=tk.BOTTOM, pady=20)
 
@@ -429,12 +420,8 @@ class AlertClient:
                 response = requests.get(f"{API_URL}/status", timeout=2)
                 data = response.json()
                 self.api_connected = True
-
-                # print(f"STATUS: {data}") # Opcjonalne: wyciszenie spamu w konsoli
-
                 raw_alerts = data.get("alerts", [])
                 self.active_alerts = self.filter_alerts(raw_alerts)
-
             except Exception:
                 self.api_connected = False
             time.sleep(POLL_INTERVAL)
@@ -446,7 +433,9 @@ class AlertClient:
             msg = f"Zalogowano: {self.username}"
             if self.is_admin: msg += " (ADMIN)"
             msg += f" | Widoczne rozmowy: {len(self.active_alerts)}"
-            self.status_label.config(text=msg, fg="black")
+            # Zachowujemy status skopiowania
+            if "Skopiowano" not in self.status_label.cget("text"):
+                self.status_label.config(text=msg, fg="black")
 
         current_ids = {alert['id'] for alert in self.active_alerts}
         new_alerts = current_ids - self.seen_alert_ids
@@ -490,6 +479,20 @@ class AlertClient:
             return f"{p[:3]} {p[3:6]} {p[6:]}"
         return phone
 
+    # --- KOPIOWANIE DO SCHOWKA ---
+    def copy_number(self, number):
+        if not number:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(number)
+        self.root.update()
+
+        # Potwierdzenie na pasku statusu
+        original_bg = self.status_label.cget("bg")
+        self.status_label.config(text=f"✅ Skopiowano do schowka: {number}", bg="#d4edda")
+
+        self.root.after(3000, lambda: self.status_label.config(bg=original_bg))
+
     def create_alert_widget(self, alert_data):
         frame = tk.Frame(self.scrollable_frame, bg="white", bd=2, relief=tk.GROOVE)
         frame.pack(fill=tk.X, pady=4)
@@ -511,7 +514,18 @@ class AlertClient:
         content = tk.Frame(frame, bg="white", padx=10, pady=5)
         content.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(content, text=f"📞 {caller} ➔ {target}", font=("Arial", 14, "bold"), bg="white").pack(anchor="w")
+        header_frame = tk.Frame(content, bg="white")
+        header_frame.pack(anchor="w", fill=tk.X)
+
+        # Klikalny numer w oknie głównym
+        lbl_phone = tk.Label(header_frame, text=f"📞 {caller}", font=("Arial", 14, "bold"),
+                             bg="white", fg="black", cursor="hand2")
+        lbl_phone.pack(side=tk.LEFT)
+        lbl_phone.bind("<Button-1>", lambda e: self.copy_number(caller))
+
+        tk.Label(header_frame, text=f" ➔ {target}", font=("Arial", 14, "bold"),
+                 bg="white", fg="#555").pack(side=tk.LEFT)
+
         if menu:
             tk.Label(content, text=f"📂 {menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(
                 anchor="w")
