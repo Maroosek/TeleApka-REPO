@@ -11,10 +11,10 @@ from datetime import datetime
 from collections import defaultdict
 
 # Konfiguracja
-# API_URL = "http://192.168.18.8:8020"
-API_URL = "http://64.225.111.62:8020"
+API_URL = "http://192.168.18.8:8020"
+#API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 1
-Token = "admin123"
+Token = "H4d98da91ji9DSAXm11"
 
 
 class LoginWindow(tk.Toplevel):
@@ -25,6 +25,7 @@ class LoginWindow(tk.Toplevel):
         self.geometry("300x200")
         self.resizable(False, False)
 
+        # Centrowanie okna
         self.update_idletasks()
         width = self.winfo_width()
         height = self.winfo_height()
@@ -32,6 +33,7 @@ class LoginWindow(tk.Toplevel):
         y = (self.winfo_screenheight() // 2) - (height // 2)
         self.geometry(f'{width}x{height}+{x}+{y}')
 
+        # Elementy GUI
         tk.Label(self, text="Zaloguj się", font=("Arial", 12, "bold")).pack(pady=10)
 
         tk.Label(self, text="Użytkownik:").pack(pady=2)
@@ -61,6 +63,7 @@ class LoginWindow(tk.Toplevel):
                 data = response.json()
                 print(f"LOGIN SUCCESSFUL: {data}")
                 self.destroy()
+                # Przekazujemy dane do funkcji startującej główną aplikację
                 self.on_login_success(
                     data.get("username"),
                     data.get("is_admin", False),
@@ -86,7 +89,13 @@ class AlertClient:
         self.is_admin = is_admin
         self.assigned_ag = assigned_ag
 
-        role_info = "ADMIN" if self.is_admin else f"Stanowisko: {self.assigned_ag or 'Brak'}"
+        # Tytuł okna (tutaj zostawiamy po przecinku, żeby nie rozciągać paska tytułu)
+        if isinstance(self.assigned_ag, list):
+            ag_title_str = ", ".join(map(str, self.assigned_ag))
+        else:
+            ag_title_str = str(self.assigned_ag) if self.assigned_ag else "Brak"
+
+        role_info = "ADMIN" if self.is_admin else f"Stanowisko: {ag_title_str}"
         self.root.title(f"Monitor połączeń JET - {self.username} [{role_info}]")
 
         try:
@@ -129,7 +138,6 @@ class AlertClient:
                                          command=self.show_history_window)
             self.history_btn.pack(side=tk.LEFT, padx=1)
 
-            # GUZIK: Wykaz
             self.report_btn = tk.Button(self.admin_btn_frame, text="Wykaz", font=("Arial", 8, "bold"),
                                         bg="#d1ecf1", width=8, bd=1,
                                         command=self.show_report_window)
@@ -137,9 +145,16 @@ class AlertClient:
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
 
+        # --- ZMIANA: Lista w pionie dla ekranu oczekiwania ---
         wait_msg = "System czuwa."
         if not self.is_admin and self.assigned_ag:
-            wait_msg += f"\nOczekiwanie na połączenia dla: {self.assigned_ag}"
+            # Tworzymy string z nowymi liniami (\n) dla każdego numeru
+            if isinstance(self.assigned_ag, list):
+                ag_vertical = "\n".join(map(str, self.assigned_ag))
+            else:
+                ag_vertical = str(self.assigned_ag)
+
+            wait_msg += f"\n\nOczekiwanie na połączenia dla:\n{ag_vertical}"
         elif self.is_admin:
             wait_msg += "\nTryb Administratora (Wszystkie połączenia)"
 
@@ -179,6 +194,12 @@ class AlertClient:
         rep_win.title("Wykaz dzienny - Podsumowanie")
         rep_win.geometry("750x500")
 
+        # --- ZMIENNE STANU ---
+        current_report_data = None
+        var_detailed = tk.BooleanVar(value=True)  # Domyślnie szczegółowy
+        current_sort_col = "firma"  # Domyślne sortowanie po nazwie
+        current_sort_reverse = False  # Domyślnie A-Z (rosnąco)
+
         # Pasek górny
         top_frame = tk.Frame(rep_win, pady=10, padx=10, bg="#f8f9fa")
         top_frame.pack(fill=tk.X)
@@ -190,16 +211,12 @@ class AlertClient:
         entry_date.insert(0, today_str)
         entry_date.pack(side=tk.LEFT, padx=5)
 
-        # Kontener na drzewo wyników
+        # Kontener na drzewo
         tree_frame = tk.Frame(rep_win)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         columns = ("firma", "typ", "ilosc")
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-
-        tree.heading("firma", text="Firma (Słowo kluczowe)")
-        tree.heading("typ", text="Typ")
-        tree.heading("ilosc", text="Ilość Połączeń")
 
         tree.column("firma", width=250)
         tree.column("typ", width=250)
@@ -217,15 +234,85 @@ class AlertClient:
         status_lbl = tk.Label(rep_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
         status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Funkcja zapisująca do CSV
-        def save_to_csv():
-            if not tree.get_children():
-                messagebox.showwarning("Brak danych", "Najpierw pobierz dane, aby móc je zapisać.")
+        # --- FUNKCJA RENDERUJĄCA (z sortowaniem) ---
+        def render_tree():
+            # Czyścimy obecny widok
+            for item in tree.get_children():
+                tree.delete(item)
+
+            if not current_report_data:
                 return
 
-            # Pobranie wybranej daty dla domyślnej nazwy pliku
+            show_details = var_detailed.get()
+
+            # Pobieramy listę firm (kluczy)
+            companies = list(current_report_data.keys())
+
+            # Logika sortowania listy firm
+            if current_sort_col == "firma":
+                companies.sort(reverse=current_sort_reverse)
+            elif current_sort_col == "ilosc":
+                # Sortujemy po wartości "Wszystkie" dla danej firmy
+                companies.sort(key=lambda x: current_report_data[x]["Wszystkie"], reverse=current_sort_reverse)
+
+            for company in companies:
+                types = current_report_data[company]
+
+                # 1. Wiersze szczegółowe (jeśli włączone)
+                if show_details:
+                    # Sortujemy podtypy, ale "Wszystkie" pomijamy tutaj
+                    subtypes = sorted([t for t in types.keys() if t != "Wszystkie"])
+                    for t_name in subtypes:
+                        count = types[t_name]
+                        tree.insert("", tk.END, values=(company, t_name, count), tags=("normal_row",))
+
+                # 2. Podsumowanie (zawsze)
+                total_count = types["Wszystkie"]
+                tree.insert("", tk.END, values=(company, "Wszystkie", total_count), tags=("total_row",))
+
+        # --- OBSŁUGA KLIKNIĘCIA W NAGŁÓWEK ---
+        def on_header_click(col):
+            nonlocal current_sort_col, current_sort_reverse
+
+            # Jeśli kliknięto w to samo co ostatnio -> odwróć kolejność
+            if current_sort_col == col:
+                current_sort_reverse = not current_sort_reverse
+            else:
+                # Nowa kolumna -> domyślnie rosnąco (chyba że ilość, to logiczniej malejąco na start, ale trzymajmy standard)
+                current_sort_col = col
+                current_sort_reverse = True if col == "ilosc" else False
+
+                # Aktualizacja strzałek w nagłówkach
+            headers = {"firma": "Firma (Słowo kluczowe)", "typ": "Typ", "ilosc": "Ilość Połączeń"}
+
+            for key, val in headers.items():
+                tree.heading(key, text=val)  # Reset nazw
+
+            arrow = " ▼" if current_sort_reverse else " ▲"
+            current_text = headers.get(col, col)
+            tree.heading(col, text=current_text + arrow)
+
+            render_tree()
+
+        # Konfiguracja nagłówków z komendami
+        tree.heading("firma", text="Firma (Słowo kluczowe)", command=lambda: on_header_click("firma"))
+        tree.heading("typ", text="Typ")  # Typu nie sortujemy globalnie, bo jest zależny od firmy
+        tree.heading("ilosc", text="Ilość Połączeń", command=lambda: on_header_click("ilosc"))
+
+        # Checkbox i reszta UI
+        cb_detailed = tk.Checkbutton(top_frame, text="Raport szczegółowy",
+                                     variable=var_detailed, bg="#f8f9fa",
+                                     command=render_tree)
+        cb_detailed.pack(side=tk.LEFT, padx=15)
+
+        def save_to_csv():
+            if not tree.get_children():
+                messagebox.showwarning("Brak danych", "Najpierw pobierz dane.")
+                return
+
             date_str = entry_date.get().strip() or "nieznana-data"
-            default_filename = f"Wykaz połączeń telefonii {date_str}"
+            mode_str = "szczegolowy" if var_detailed.get() else "ogolny"
+            default_filename = f"Wykaz {mode_str} {date_str}"
 
             path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
@@ -238,169 +325,123 @@ class AlertClient:
                 return
 
             try:
-                # Otwieramy plik z kodowaniem utf-8-sig (Excel friendly)
                 with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f, delimiter=';')
-                    writer.writerow(["Firma", "Typ", "Ilość"])  # Nagłówek
-
+                    writer.writerow(["Firma", "Typ", "Ilość"])
                     for child in tree.get_children():
                         values = tree.item(child)["values"]
                         writer.writerow(values)
-
-                status_lbl.config(text=f"Zapisano do pliku: {path}", fg="green")
-                messagebox.showinfo("Sukces", "Dane zostały pomyślnie zapisane do pliku CSV.")
-
+                status_lbl.config(text=f"Zapisano: {path}", fg="green")
             except Exception as e:
-                messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać pliku: {e}")
+                messagebox.showerror("Błąd", f"Nie udało się zapisać: {e}")
 
         def fetch_report():
+            nonlocal current_report_data
             date_val = entry_date.get().strip()
             if not date_val:
                 messagebox.showwarning("Błąd", "Wpisz datę.")
                 return
 
-            status_lbl.config(text="Pobieranie danych z API...", fg="blue")
+            status_lbl.config(text="Pobieranie...", fg="blue")
             rep_win.update()
 
-            # Czyścimy widok
-            for item in tree.get_children():
-                tree.delete(item)
-
-            # --- MAPA KOREKT ---
             NAME_CORRECTIONS = {
                 "polskikominiarz": "polski kominiarz",
                 "liderizolacji": "lider izolacji",
                 "betoniarnia-beton": "betoniarnia beton",
                 "betoniarnia": "betoniarnia.pl",
-                "liderbeton": "lider beton"
+                "liderbeton": "lider beton",
+                "lider beton strona": "lider beton"
             }
 
             try:
                 url = f"{API_URL}/telestrada/connections"
-                print(f"DEBUG: Wysyłanie zapytania do: {url}?date={date_val}")
-
-                response = requests.get(url, params={"date": date_val}, timeout=15)
+                response = requests.get(f"{API_URL}/telestrada/connections", params={"date": date_val, "token": Token})
 
                 if response.status_code == 200:
                     data = response.json()
-
-                    print(f"DEBUG: Otrzymane dane (typu {type(data)}): {str(data)[:200]}...")
-
                     connections = []
+
                     if isinstance(data, list):
                         connections = data
                     elif isinstance(data, dict):
                         if "connections" in data:
                             connections = data["connections"]
                         else:
-                            found_list = False
                             for key, val in data.items():
                                 if isinstance(val, list) and len(val) > 0:
                                     connections = val
-                                    found_list = True
                                     break
-                            if not found_list:
+                            if not connections:
                                 connections = list(data.values())
 
                     if not connections:
-                        status_lbl.config(text="Brak danych (pusta lista) za wybrany dzień.", fg="orange")
+                        status_lbl.config(text="Brak danych.", fg="orange")
+                        current_report_data = None
+                        render_tree()
                         return
 
-                    # --- LOGIKA GRUPOWANIA ---
                     stats = defaultdict(lambda: defaultdict(int))
                     count_total = 0
 
                     for conn in connections:
-                        if not isinstance(conn, dict):
-                            continue
-
+                        if not isinstance(conn, dict): continue
                         menu_full = conn.get("element_menu_name") or conn.get("menu_name") or ""
-
-                        if not menu_full:
-                            continue
+                        if not menu_full: continue
 
                         count_total += 1
                         menu_full = menu_full.strip()
 
-                        # Pobieranie czasu trwania
                         try:
                             duration = int(conn.get("billsec", 0))
-                        except (ValueError, TypeError):
+                        except:
                             duration = 0
 
                         company_name = ""
                         type_name = ""
 
-                        # 1. Sprawdzamy czy jest myślnik " - "
                         if " - " in menu_full:
                             parts = menu_full.split(" - ", 1)
-                            company_name = parts[0].strip().lower()  # Zmiana na małe litery
+                            company_name = parts[0].strip().lower()
                             type_name = parts[1].strip()
                         else:
-                            # 2. Brak myślnika -> Ucinamy numer telefonu TYLKO jeśli to faktycznie numer
-                            # Sprawdzamy, czy ostatnie 9 znaków (po usunięciu spacji) to cyfry
-
                             check_digits = menu_full.replace(" ", "")
-
-                            # Jeśli długość wystarczająca i końcówka to cyfry -> ucinamy
                             if len(check_digits) >= 9 and check_digits[-9:].isdigit():
                                 company_name = menu_full[:-9].strip().lower()
                             else:
-                                # Jeśli nie kończy się cyframi (np. "lider beton"), bierzemy całość
                                 company_name = menu_full.strip().lower()
-
                             ivr_number = conn.get("ivr_phone_number", "brak_ivr")
                             type_name = f"Inne/Brak - {ivr_number}"
 
-                        # --- KOREKTA NAZW ---
                         if company_name in NAME_CORRECTIONS:
                             company_name = NAME_CORRECTIONS[company_name]
-                        # --------------------
-
                         if not company_name:
                             company_name = "nieznana firma"
 
-                        # 3. Filtr < 7s
                         if duration < 7:
                             type_name = f"{type_name} (Mniej niż 7s)"
 
                         stats[company_name][type_name] += 1
                         stats[company_name]["Wszystkie"] += 1
 
-                    # --- WYŚWIETLANIE ---
-                    if count_total == 0:
-                        status_lbl.config(text="Pobrano dane, ale brak nazw menu do analizy.", fg="orange")
-                        return
+                    current_report_data = stats
 
-                    for company in sorted(stats.keys()):
-                        types = stats[company]
-                        # Najpierw szczegółowe
-                        for t_name, count in types.items():
-                            if t_name == "Wszystkie":
-                                continue
-                            tree.insert("", tk.END, values=(company, t_name, count), tags=("normal_row",))
+                    # Domyślny reset sortowania przy nowym pobraniu (opcjonalne)
+                    # current_sort_col = "firma"
+                    # current_sort_reverse = False
 
-                        # Podsumowanie
-                        total_count = types["Wszystkie"]
-                        tree.insert("", tk.END, values=(company, "Wszystkie", total_count), tags=("total_row",))
-
-                    status_lbl.config(text=f"Sukces: Przeanalizowano {count_total} połączeń.", fg="green")
-
+                    render_tree()
+                    status_lbl.config(text=f"Sukces: {count_total} połączeń.", fg="green")
                 else:
                     status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
-                    print(f"DEBUG ERROR BODY: {response.text}")
 
             except Exception as e:
-                status_lbl.config(text=f"Błąd krytyczny: {str(e)}", fg="red")
-                print(f"DEBUG EXCEPTION: {e}")
+                status_lbl.config(text=f"Błąd: {str(e)}", fg="red")
 
-        # Guziki
-        btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white",
-                              command=fetch_report)
+        btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white", command=fetch_report)
         btn_fetch.pack(side=tk.LEFT, padx=10)
 
-        btn_save = tk.Button(top_frame, text="Zapisz dane (.csv)", bg="#28a745", fg="white",
-                             command=save_to_csv)
+        btn_save = tk.Button(top_frame, text="Zapisz dane (.csv)", bg="#28a745", fg="white", command=save_to_csv)
         btn_save.pack(side=tk.LEFT, padx=10)
 
     # --- KONIEC NOWEJ FUNKCJI ---
@@ -502,7 +543,7 @@ class AlertClient:
             if not hist_win.winfo_exists():
                 return
             try:
-                response = requests.get(f"{API_URL}/history", timeout=5)
+                response = requests.get(f"{API_URL}/history", params={"token": Token}, timeout=5)
                 if response.status_code == 200:
                     logs = response.json().get("logs", [])
                     now = datetime.now()
@@ -578,8 +619,9 @@ class AlertClient:
         tk.Label(help_win, text="O Aplikacji", font=("Arial", 12, "bold")).pack(pady=(10, 5))
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
-                "(Działa w oknie głównym i w Historii)\n\n"
-                "Wersja 0.8"
+                "(Działa w oknie głównym i w Historii)\n"
+                "(Opis do uzupełnienia, to nie pisze AI :v)\n\n"
+                "Wersja 0.6 [06.02]"
                 )
 
         if not self.is_admin:
@@ -611,16 +653,29 @@ class AlertClient:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def filter_alerts(self, all_alerts):
+        # Admin widzi wszystko
         if self.is_admin:
             return all_alerts
 
+        # Jeśli użytkownik nie ma przypisanych żadnych AG, nie widzi nic
         if not self.assigned_ag:
             return []
 
+        # Zabezpieczenie: upewniamy się, że assigned_ag to lista stringów
+        # (API powinno to gwarantować, ale dla bezpieczeństwa w kliencie):
+        allowed_sources = self.assigned_ag
+        if not isinstance(allowed_sources, list):
+            allowed_sources = [str(allowed_sources)]
+
+        # Konwersja na stringi dla pewności porównania
+        allowed_sources = [str(s) for s in allowed_sources]
+
         filtered = []
         for alert in all_alerts:
-            if str(alert.get("source")) == str(self.assigned_ag):
+            # SPRAWDZENIE: Czy źródło (alert source) znajduje się na liście dozwolonych (allowed_sources)
+            if str(alert.get("source")) in allowed_sources:
                 filtered.append(alert)
+
         return filtered
 
     def network_loop(self):
@@ -708,9 +763,25 @@ class AlertClient:
 
         raw_caller = alert_data.get('caller', 'Nieznany')
         caller = self.format_phone_number(raw_caller)
+
+        # Pobieramy dane
         target = alert_data.get('agent_name') or alert_data.get('source', 'Infolinia')
         menu = alert_data.get('menu_name')
         status = alert_data.get('status') or "Dzwoni..."
+
+        # --- ZMIANA: Usuwanie cyfr dla zwykłego użytkownika ---
+        if not self.is_admin:
+            # Usuwamy cyfry z nazwy Agenta/Targetu
+            target = re.sub(r'\d+', '', str(target)).strip()
+            # Usuwamy ewentualne myślniki na początku (np. z "805 - Jan" zostaje "- Jan")
+            target = target.lstrip('- ').strip()
+
+            if menu:
+                # Usuwamy cyfry z Menu
+                menu = re.sub(r'\d+', '', str(menu)).strip()
+                # Kosmetyka menu (np. z "1 - Sprzedaż" zostaje "- Sprzedaż")
+                menu = menu.lstrip('- ').strip()
+        # -----------------------------------------------------
 
         status_color = "#007bff"
         if status in ["ANSWERED", "Odebrane"]:

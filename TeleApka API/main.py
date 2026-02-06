@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Union
 from pymongo.errors import DuplicateKeyError
 from urllib.parse import parse_qs
 import httpx
@@ -19,6 +19,7 @@ import urllib.parse
 # Próba importu konfigu
 try:
     from config import MongoCredentials
+
     mongo_url = MongoCredentials.MONGODB_URL
     db_name = MongoCredentials.DATABASE_NAME
     collection_name = MongoCredentials.COLLECTION_NAME
@@ -44,27 +45,23 @@ collection_users = None
 collection_logs = None
 collection_sms = None
 
+
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, collection, collection_users, collection_logs, collection_sms
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
 
-    # 1. Najpierw inicjujemy klienta, żeby zmienne nie były None
     try:
         client = AsyncIOMotorClient(mongo_url)
         db = client[db_name]
 
-        # Przypisujemy kolekcje od razu (nawet jak indeksy się nie udadzą, baza będzie działać)
         collection = db[collection_name]
         collection_users = db[collection_users_name]
         collection_logs = db[collection_logs_name]
         collection_sms = db[collection_sms_name]
 
         print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
-
-        # 2. Tworzenie indeksów w oddzielnych blokach try/except
-        # Dzięki temu błąd w jednej kolekcji nie wyłączy całego API
 
         try:
             await collection.create_index("call_id", unique=True)
@@ -81,15 +78,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Nie udało się utworzyć indeksu dla HISTORY: {e}")
 
-        # try:
-        #     # Tu też unique=True, ale jeśli masz stare duplikaty, to się nie utworzy (ale API wstanie)
-        #     await collection_sms.create_index("_id", unique=True)
-        # except Exception as e:
-        #     print(f"⚠️ Nie udało się utworzyć indeksu dla SMS: {e}")
-
     except Exception as e:
         print(f"❌ KRYTYCZNY BŁĄD POŁĄCZENIA Z BAZĄ: {e}")
-        # Tutaj zmienne mogą zostać None, jeśli padnie samo połączenie z URL
 
     yield
     print("LOG: Zamykanie serwera.")
@@ -123,7 +113,7 @@ class AlertSchema(BaseModel):
 
 class UserCreate(BaseModel):
     username: str
-    assigned_ag: Optional[str] = None
+    assigned_ag: Optional[List[str]] = None
     is_admin: bool = False
 
 
@@ -138,12 +128,12 @@ class StatusResponse(BaseModel):
     alerts: List[AlertSchema]
 
 
-# --- NOWE MODELE DLA HISTORII ---
 class LogEntrySchema(BaseModel):
     id: str
     phone_number: str
     last_call: datetime
     last_menu_full: Optional[str] = None
+
 
 class HistoryResponse(BaseModel):
     count: int
@@ -169,11 +159,22 @@ async def login(data: LoginSchema):
     if not user:
         raise HTTPException(status_code=404, detail="Taki użytkownik nie istnieje.")
 
+    # ZMIANA 2: Normalizacja assigned_ag, aby zawsze zwracać listę (nawet dla starych rekordów)
+    raw_assigned = user.get("assigned_ag")
+    assigned_list = []
+
+    if raw_assigned:
+        if isinstance(raw_assigned, list):
+            assigned_list = raw_assigned
+        else:
+            # Jeśli w bazie jest stary format (string), zamień go na listę jednoelementową
+            assigned_list = [str(raw_assigned)]
+
     return {
         "message": "Zalogowano",
         "username": user["username"],
         "is_admin": user.get("is_admin", False),
-        "assigned_ag": user.get("assigned_ag")
+        "assigned_ag": assigned_list  # Zwracamy zawsze listę
     }
 
 
@@ -205,70 +206,53 @@ async def get_status():
         "alerts": mapped_alerts
     }
 
-# --- NOWY ENDPOINT: POBIERANIE POŁĄCZEŃ Z TELESTRADY ---
+
 @app.get("/telestrada/connections")
 async def get_telestrada_connections(
-        date: str = Query(..., description="Data w formacie YYYY-MM-DD", example="2026-02-05")):
-    """
-    Pobiera listę połączeń z API Telestrady dla wskazanego dnia.
-    Wymaga uzupełnienia klucza API w pliku config.py w klasie Telestrada.
-    """
+        date: str = Query(..., description="Data w formacie YYYY-MM-DD", example="2026-02-05"),
+        token: str = Query(..., description="Token administratora")
+):
+    # ZABEZPIECZENIE
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
 
-    # 1. Pobranie klucza API z Twojego configu
-    # Zakładam, że w pliku config.py w klasie Telestrada dodasz pole API_KEY
     api_key = getattr(Telestrada, "API_KEY", None)
-
-    # Fallback: jeśli nie ma w klasie, sprawdź zmienną środowiskową lub wpisz ręcznie testowo
     if not api_key:
         api_key = os.getenv("TELESTRADA_API_KEY")
 
     if not api_key:
         raise HTTPException(status_code=500, detail="Brak skonfigurowanego klucza API Telestrady (Telestrada.API_KEY).")
 
-    # 2. Konfiguracja zapytania
     url = "https://api.telestrada.pl/api/v1/callcontact/connections"
-
     headers = {
         "api-key": api_key,
         "Accept": "application/json"
     }
-
     params = {
-        "date": date  # Format YYYY-MM-DD
+        "date": date
     }
 
-    # 3. Wykonanie asynchronicznego zapytania HTTP
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, params=params, timeout=10.0)
-
-            # Jeśli status code jest inny niż 2xx, rzuć wyjątek
             response.raise_for_status()
-
             return response.json()
-
         except httpx.HTTPStatusError as e:
-            # Obsługa błędów zwróconych przez API Telestrady (np. 401, 403, 404)
             raise HTTPException(status_code=e.response.status_code, detail=f"Błąd API Telestrady: {e.response.text}")
         except Exception as e:
-            # Obsługa błędów połączenia
             raise HTTPException(status_code=500, detail=f"Błąd połączenia z Telestradą: {str(e)}")
 
-# --- NOWY ENDPOINT: WYŚWIETLANIE LOGÓW ---
+
 @app.get("/history", response_model=HistoryResponse)
-async def get_history():
-    """
-    Pobiera CAŁĄ historię logowań numerów z menu.
-    Zwraca wszystkie wpisy, posortowane od najnowszego.
-    """
+async def get_history(token: str = Query(..., description="Token administratora")):
+    # ZABEZPIECZENIE
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
+
     if collection_logs is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych logów")
 
-    # Pobierz logi, sortuj malejąco po dacie.
-    # Usunięto .limit(), aby nie ograniczać wyników po stronie zapytania.
     cursor = collection_logs.find().sort("last_call", -1)
-
-    # length=None oznacza pobranie wszystkich dokumentów z kursora
     logs_docs = await cursor.to_list(length=None)
 
     mapped_logs = []
@@ -290,6 +274,8 @@ async def get_history():
 async def create_user(user: UserCreate, token: str):
     if collection_users is None:
         raise HTTPException(status_code=503, detail="Brak połączenia z bazą użytkowników")
+
+    # Pydantic sam zwaliduje, że assigned_ag to lista stringów lub None
     user_data = user.dict()
 
     if token != GLOBAL_ACCESS_TOKEN:
@@ -304,10 +290,8 @@ async def create_user(user: UserCreate, token: str):
         raise HTTPException(status_code=500, detail=f"Błąd bazy: {str(e)}")
 
 
-# --- NOWY ENDPOINT: SMS CALLBACK ---
 @app.post("/SMSAPI/addSMS")
 async def add_sms(request: Request):
-    # ... (początek funkcji bez zmian, pobieranie body, parsowanie itp.) ...
     if collection_sms is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
@@ -326,33 +310,21 @@ async def add_sms(request: Request):
         username = get_val("username")
         msg_id_raw = get_val("MsgId")
 
-        # ... (kod zapisujący do Mongo bez zmian) ...
-        # ... (insert_one itd.) ...
-
-        # Zapisano w Mongo, teraz Bitrix:
+        # Tu byłby kod zapisu do mongo (pominięty w skrócie, bo nie dotyczy pytania)
 
         print("🔄 Próba dodania aktywności do Bitrix24...")
 
         try:
-            # ZMIANA 1: Przekazujemy sms_from bezpośrednio, zamiast szukać w bazie
             bitrixData = find_owner_by_incoming_sms(sms_from)
-
-            # ZMIANA 2: Sprawdzamy czy cokolwiek znaleziono, zanim spróbujemy odczytać dane
             if bitrixData:
-                Owner_id = bitrixData["OWNER_ID"]  # Pamiętaj o wielkości liter kluczy w słowniku!
+                Owner_id = bitrixData["OWNER_ID"]
                 Owner_type = bitrixData["OWNER_TYPE_ID"]
-                # Używamy znalezionego opiekuna lub domyślnie np. 1 (Admin)
                 Responsible = bitrixData.get("RESPONSIBLE_ID", "1")
-
-                # Opis zadania
                 description = f"[B]SMS od:[/B] {sms_from}\n[B]Treść:[/B]\n{sms_text}"
-
                 add_new_activity(Owner_id, Owner_type, Responsible, description)
             else:
                 print("ℹ️ Nie dodano aktywności do Bitrix (brak powiązanego Deala/Leada).")
-
         except Exception as e:
-            # Ten try-except łapie błędy tylko z sekcji Bitrixa, API nie padnie
             print(f"❌ Błąd integracji Bitrix: {e}")
             import traceback
             traceback.print_exc()
@@ -362,12 +334,11 @@ async def add_sms(request: Request):
     except DuplicateKeyError:
         print(f"⚠️ Duplikat SMS. Ignoruję.")
         return Response(content="OK", media_type="text/plain")
-
     except Exception as e:
         print(f"❌ Błąd ogólny zapisu SMS: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- WEBHOOK  ---
+
 @app.get("/webhook/telestrada")
 async def telestrada_webhook(
         id: str = Query(..., description="Unikalne ID połączenia (#call_id#)"),
@@ -381,7 +352,6 @@ async def telestrada_webhook(
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
-    # --- LOGIKA LOGOWANIA NUMERU Z MENU ---
     if menu and collection_logs is not None:
         try:
             target_number = menu.strip()[-9:]
@@ -399,7 +369,6 @@ async def telestrada_webhook(
                 print(f"💾 Zalogowano połączenie dla numeru z menu: {target_number}")
         except Exception as e:
             print(f"❌ Błąd podczas logowania numeru z menu: {e}")
-    # ---------------------------------------------
 
     if not czy_trwa:
         print(f"📞 Koniec połączenia {id} ({status}). Usuwam.")
@@ -409,8 +378,8 @@ async def telestrada_webhook(
     existing = await collection.find_one({"call_id": id})
     if not existing:
         count = await collection.count_documents({})
-        if count >= 25:
-            print("⚠️ Osiągnięto limit 25 połączeń. Ignoruję nowe.")
+        if count >= 50:
+            print("⚠️ Osiągnięto limit 50 połączeń. Ignoruję nowe.")
             return "LIMIT_REACHED"
 
     caller_num = numer
@@ -437,4 +406,5 @@ async def telestrada_webhook(
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=port)
