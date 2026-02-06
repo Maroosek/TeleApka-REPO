@@ -1,20 +1,17 @@
-import os, random, time
+import os
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union
+from typing import List, Optional
 from pymongo.errors import DuplicateKeyError
 from urllib.parse import parse_qs
 import httpx
 
 from Bitrix24 import find_owner_by_incoming_sms, add_new_activity
 from config import Telestrada
-
-import urllib.request
-import urllib.parse
 
 # Próba importu konfigu
 try:
@@ -317,11 +314,11 @@ async def add_sms(request: Request):
         try:
             bitrixData = find_owner_by_incoming_sms(sms_from)
             if bitrixData:
-                Owner_id = bitrixData["OWNER_ID"]
-                Owner_type = bitrixData["OWNER_TYPE_ID"]
-                Responsible = bitrixData.get("RESPONSIBLE_ID", "1")
+                owner_id = bitrixData["OWNER_ID"]
+                owner_type = bitrixData["OWNER_TYPE_ID"]
+                responsible = bitrixData.get("RESPONSIBLE_ID", "1")
                 description = f"[B]SMS od:[/B] {sms_from}\n[B]Treść:[/B]\n{sms_text}"
-                add_new_activity(Owner_id, Owner_type, Responsible, description)
+                add_new_activity(owner_id, owner_type, responsible, description)
             else:
                 print("ℹ️ Nie dodano aktywności do Bitrix (brak powiązanego Deala/Leada).")
         except Exception as e:

@@ -7,12 +7,19 @@ import time
 import copy
 import csv
 import re
+import os
 from datetime import datetime
 from collections import defaultdict
 
+# --- ZMIANA 1: Import biblioteki dźwiękowej (Windows) ---
+try:
+    import winsound
+except ImportError:
+    winsound = None  # Fallback dla systemów innych niż Windows
+
 # Konfiguracja
-API_URL = "http://192.168.18.8:8020"
-#API_URL = "http://64.225.111.62:8020"
+#API_URL = "http://192.168.18.8:8020"
+API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 1
 Token = "H4d98da91ji9DSAXm11"
 
@@ -115,6 +122,7 @@ class AlertClient:
         self.active_alerts = []
         self.seen_alert_ids = set()
         self.last_data_snapshot = None
+        self.is_sound_playing = False
 
         # --- GUI ---
         self.bottom_bar = tk.Frame(root, bd=1, relief=tk.SUNKEN)
@@ -128,8 +136,19 @@ class AlertClient:
                                   command=self.show_help_window)
         self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
 
+        # --- ZMIANA 2 i 3: Checkbox dźwięku i logika Admina ---
+        # Jeśli Admin -> domyślnie False (wyłączony), jeśli Użytkownik -> True (włączony)
+        default_sound_state = False if self.is_admin else True
+        self.sound_enabled = tk.BooleanVar(value=default_sound_state)
+
+
+        # -----------------------------------------------------
+
         # --- Sekcja przycisków Admina ---
         if self.is_admin:
+            # self.sound_chk = tk.Checkbutton(self.bottom_bar, text="Dźwięk", variable=self.sound_enabled)
+            # self.sound_chk.pack(side=tk.RIGHT, padx=5)
+
             self.admin_btn_frame = tk.Frame(self.bottom_bar)
             self.admin_btn_frame.pack(side=tk.LEFT, padx=2, pady=1)
 
@@ -145,10 +164,9 @@ class AlertClient:
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
 
-        # --- ZMIANA: Lista w pionie dla ekranu oczekiwania ---
+        # --- Lista w pionie dla ekranu oczekiwania ---
         wait_msg = "System czuwa."
         if not self.is_admin and self.assigned_ag:
-            # Tworzymy string z nowymi liniami (\n) dla każdego numeru
             if isinstance(self.assigned_ag, list):
                 ag_vertical = "\n".join(map(str, self.assigned_ag))
             else:
@@ -188,7 +206,7 @@ class AlertClient:
         if messagebox.askyesno("Zamykanie", "Czy na pewno chcesz zamknąć monitor połączeń?"):
             self.root.destroy()
 
-    # --- NOWA FUNKCJA: OKNO WYKAZU (RAPORTU) ---
+
     def show_report_window(self):
         rep_win = tk.Toplevel(self.root)
         rep_win.title("Wykaz dzienny - Podsumowanie")
@@ -196,9 +214,9 @@ class AlertClient:
 
         # --- ZMIENNE STANU ---
         current_report_data = None
-        var_detailed = tk.BooleanVar(value=True)  # Domyślnie szczegółowy
-        current_sort_col = "firma"  # Domyślne sortowanie po nazwie
-        current_sort_reverse = False  # Domyślnie A-Z (rosnąco)
+        var_detailed = tk.BooleanVar(value=False)  # Domyślnie zwinięte (widok ogólny)
+        current_sort_col = "#0"  # Domyślne sortowanie po kolumnie drzewa (Firma)
+        current_sort_reverse = False  # Domyślnie A-Z
 
         # Pasek górny
         top_frame = tk.Frame(rep_win, pady=10, padx=10, bg="#f8f9fa")
@@ -215,15 +233,25 @@ class AlertClient:
         tree_frame = tk.Frame(rep_win)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        columns = ("firma", "typ", "ilosc")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        # ZMIANA: Definicja kolumn - "Firma" jest teraz w kolumnie #0 (drzewo)
+        columns = ("typ", "ilosc")
+        # show="tree headings" pokazuje kolumnę #0 (drzewo) oraz nagłówki pozostałych
+        tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
 
-        tree.column("firma", width=250)
-        tree.column("typ", width=250)
+        # Konfiguracja kolumny drzewa (#0)
+        tree.heading("#0", text="Firma (Słowo kluczowe)", anchor=tk.W)
+        tree.column("#0", width=250, anchor=tk.W)
+
+        # Konfiguracja pozostałych kolumn
+        tree.heading("typ", text="Typ")
+        tree.column("typ", width=250, anchor=tk.W)
+
+        tree.heading("ilosc", text="Ilość Połączeń")
         tree.column("ilosc", width=100, anchor=tk.CENTER)
 
+        # Tagi stylów
         tree.tag_configure("total_row", font=("Arial", 10, "bold"), background="#e8e8e8")
-        tree.tag_configure("normal_row", font=("Arial", 10))
+        tree.tag_configure("detail_row", font=("Arial", 9), background="white")
 
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -234,85 +262,99 @@ class AlertClient:
         status_lbl = tk.Label(rep_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
         status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # --- FUNKCJA RENDERUJĄCA (z sortowaniem) ---
+        # --- FUNKCJA RENDERUJĄCA (ZMODYFIKOWANA) ---
         def render_tree():
-            # Czyścimy obecny widok
+            # Czyścimy drzewo
             for item in tree.get_children():
                 tree.delete(item)
 
             if not current_report_data:
                 return
 
-            show_details = var_detailed.get()
+            # Stan checkboxa decyduje czy drzewo jest domyślnie rozwinięte
+            expand_all = var_detailed.get()
 
-            # Pobieramy listę firm (kluczy)
             companies = list(current_report_data.keys())
 
-            # Logika sortowania listy firm
-            if current_sort_col == "firma":
+            # Sortowanie głównych węzłów (Firm)
+            if current_sort_col == "#0":  # Sortowanie po nazwie firmy
                 companies.sort(reverse=current_sort_reverse)
-            elif current_sort_col == "ilosc":
-                # Sortujemy po wartości "Wszystkie" dla danej firmy
+            elif current_sort_col == "ilosc":  # Sortowanie po ilości całkowitej
                 companies.sort(key=lambda x: current_report_data[x]["Wszystkie"], reverse=current_sort_reverse)
 
             for company in companies:
                 types = current_report_data[company]
-
-                # 1. Wiersze szczegółowe (jeśli włączone)
-                if show_details:
-                    # Sortujemy podtypy, ale "Wszystkie" pomijamy tutaj
-                    subtypes = sorted([t for t in types.keys() if t != "Wszystkie"])
-                    for t_name in subtypes:
-                        count = types[t_name]
-                        tree.insert("", tk.END, values=(company, t_name, count), tags=("normal_row",))
-
-                # 2. Podsumowanie (zawsze)
                 total_count = types["Wszystkie"]
-                tree.insert("", tk.END, values=(company, "Wszystkie", total_count), tags=("total_row",))
 
-        # --- OBSŁUGA KLIKNIĘCIA W NAGŁÓWEK ---
+                # 1. Wstawiamy RODZICA (Firmę - Podsumowanie)
+                # text=company wstawia nazwę w kolumnę #0 (tę ze strzałką)
+                parent_id = tree.insert(
+                    "",
+                    tk.END,
+                    text=company,
+                    values=("Wszystkie (Podsumowanie)", total_count),
+                    tags=("total_row",),
+                    open=expand_all  # Tutaj decydujemy czy rozwinięte
+                )
+
+                # 2. Wstawiamy DZIECI (Szczegóły) - zawsze są w strukturze, widoczność zależy od 'open' rodzica
+                subtypes = sorted([t for t in types.keys() if t != "Wszystkie"])
+                for t_name in subtypes:
+                    count = types[t_name]
+                    # Wstawiamy jako dziecko 'parent_id'
+                    tree.insert(
+                        parent_id,
+                        tk.END,
+                        text="",  # Puste w kolumnie drzewa
+                        values=(t_name, count),
+                        tags=("detail_row",)
+                    )
+
+        # --- OBSŁUGA NAGŁÓWKÓW (SORTOWANIE) ---
         def on_header_click(col):
             nonlocal current_sort_col, current_sort_reverse
-
-            # Jeśli kliknięto w to samo co ostatnio -> odwróć kolejność
             if current_sort_col == col:
                 current_sort_reverse = not current_sort_reverse
             else:
-                # Nowa kolumna -> domyślnie rosnąco (chyba że ilość, to logiczniej malejąco na start, ale trzymajmy standard)
                 current_sort_col = col
+                # Domyślnie malejąco dla ilości, rosnąco dla tekstu
                 current_sort_reverse = True if col == "ilosc" else False
 
-                # Aktualizacja strzałek w nagłówkach
-            headers = {"firma": "Firma (Słowo kluczowe)", "typ": "Typ", "ilosc": "Ilość Połączeń"}
+            # Odświeżanie strzałek w nagłówkach
+            headers = {"#0": "Firma (Słowo kluczowe)", "typ": "Typ", "ilosc": "Ilość Połączeń"}
 
+            # Reset nagłówków
             for key, val in headers.items():
-                tree.heading(key, text=val)  # Reset nazw
+                tree.heading(key, text=val)
 
+            # Ustawienie strzałki na aktywnym
             arrow = " ▼" if current_sort_reverse else " ▲"
-            current_text = headers.get(col, col)
-            tree.heading(col, text=current_text + arrow)
+            base_text = headers.get(col, col)
+            tree.heading(col, text=base_text + arrow)
 
             render_tree()
 
-        # Konfiguracja nagłówków z komendami
-        tree.heading("firma", text="Firma (Słowo kluczowe)", command=lambda: on_header_click("firma"))
-        tree.heading("typ", text="Typ")  # Typu nie sortujemy globalnie, bo jest zależny od firmy
-        tree.heading("ilosc", text="Ilość Połączeń", command=lambda: on_header_click("ilosc"))
+        # Przypisanie komend sortowania
+        tree.heading("#0", command=lambda: on_header_click("#0"))
+        tree.heading("typ", command=lambda: on_header_click(
+            "typ"))  # Sortowanie po typie wewnątrz firmy niezaimplementowane globalnie, ale nagłówek zostawiamy
+        tree.heading("ilosc", command=lambda: on_header_click("ilosc"))
 
-        # Checkbox i reszta UI
-        cb_detailed = tk.Checkbutton(top_frame, text="Raport szczegółowy",
+        # Checkbox "Rozwiń wszystko" (zmieniłem nazwę dla jasności, ale logika ta sama)
+        cb_detailed = tk.Checkbutton(top_frame, text="Rozwiń szczegóły domyślnie",
                                      variable=var_detailed, bg="#f8f9fa",
                                      command=render_tree)
         cb_detailed.pack(side=tk.LEFT, padx=15)
 
+        # --- EXPORT DO CSV (ZMODYFIKOWANY DLA STRUKTURY DRZEWA) ---
         def save_to_csv():
+            # Sprawdzamy czy są jakiekolwiek korzenie (firmy)
             if not tree.get_children():
                 messagebox.showwarning("Brak danych", "Najpierw pobierz dane.")
                 return
 
             date_str = entry_date.get().strip() or "nieznana-data"
-            mode_str = "szczegolowy" if var_detailed.get() else "ogolny"
-            default_filename = f"Wykaz {mode_str} {date_str}"
+            default_filename = f"Wykaz {date_str}"
 
             path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
@@ -320,28 +362,39 @@ class AlertClient:
                 filetypes=[("Plik CSV", "*.csv"), ("Wszystkie pliki", "*.*")],
                 title="Zapisz raport jako"
             )
-
-            if not path:
-                return
+            if not path: return
 
             try:
                 with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f, delimiter=';')
                     writer.writerow(["Firma", "Typ", "Ilość"])
-                    for child in tree.get_children():
-                        values = tree.item(child)["values"]
-                        writer.writerow(values)
+
+                    # Iterujemy po głównych węzłach (Firmach)
+                    for parent_id in tree.get_children():
+                        # Pobieramy dane rodzica
+                        parent_text = tree.item(parent_id)["text"]  # Nazwa firmy z kolumny #0
+                        parent_vals = tree.item(parent_id)["values"]  # [Typ, Ilość]
+
+                        # Zapisujemy wiersz podsumowania
+                        writer.writerow([parent_text, parent_vals[0], parent_vals[1]])
+
+                        # Iterujemy po dzieciach (szczegółach) tego rodzica
+                        for child_id in tree.get_children(parent_id):
+                            child_vals = tree.item(child_id)["values"]  # [Typ, Ilość]
+                            # Zapisujemy wiersz szczegółowy (powtarzamy nazwę firmy dla czytelności CSV)
+                            writer.writerow([parent_text, child_vals[0], child_vals[1]])
+
                 status_lbl.config(text=f"Zapisano: {path}", fg="green")
             except Exception as e:
                 messagebox.showerror("Błąd", f"Nie udało się zapisać: {e}")
 
+        # --- LOGIKA POBIERANIA DANYCH (BEZ ZMIAN W LOGICE, TYLKO RE-RENDER) ---
         def fetch_report():
             nonlocal current_report_data
             date_val = entry_date.get().strip()
             if not date_val:
                 messagebox.showwarning("Błąd", "Wpisz datę.")
                 return
-
             status_lbl.config(text="Pobieranie...", fg="blue")
             rep_win.update()
 
@@ -356,12 +409,11 @@ class AlertClient:
 
             try:
                 url = f"{API_URL}/telestrada/connections"
-                response = requests.get(f"{API_URL}/telestrada/connections", params={"date": date_val, "token": Token})
+                response = requests.get(url, params={"date": date_val, "token": Token})
 
                 if response.status_code == 200:
                     data = response.json()
                     connections = []
-
                     if isinstance(data, list):
                         connections = data
                     elif isinstance(data, dict):
@@ -372,8 +424,7 @@ class AlertClient:
                                 if isinstance(val, list) and len(val) > 0:
                                     connections = val
                                     break
-                            if not connections:
-                                connections = list(data.values())
+                            if not connections: connections = list(data.values())
 
                     if not connections:
                         status_lbl.config(text="Brak danych.", fg="orange")
@@ -391,7 +442,6 @@ class AlertClient:
 
                         count_total += 1
                         menu_full = menu_full.strip()
-
                         try:
                             duration = int(conn.get("billsec", 0))
                         except:
@@ -399,7 +449,6 @@ class AlertClient:
 
                         company_name = ""
                         type_name = ""
-
                         if " - " in menu_full:
                             parts = menu_full.split(" - ", 1)
                             company_name = parts[0].strip().lower()
@@ -413,38 +462,26 @@ class AlertClient:
                             ivr_number = conn.get("ivr_phone_number", "brak_ivr")
                             type_name = f"Inne/Brak - {ivr_number}"
 
-                        if company_name in NAME_CORRECTIONS:
-                            company_name = NAME_CORRECTIONS[company_name]
-                        if not company_name:
-                            company_name = "nieznana firma"
-
-                        if duration < 7:
-                            type_name = f"{type_name} (Mniej niż 7s)"
+                        if company_name in NAME_CORRECTIONS: company_name = NAME_CORRECTIONS[company_name]
+                        if not company_name: company_name = "nieznana firma"
+                        if duration < 7: type_name = f"{type_name} (Mniej niż 7s)"
 
                         stats[company_name][type_name] += 1
                         stats[company_name]["Wszystkie"] += 1
 
                     current_report_data = stats
-
-                    # Domyślny reset sortowania przy nowym pobraniu (opcjonalne)
-                    # current_sort_col = "firma"
-                    # current_sort_reverse = False
-
                     render_tree()
                     status_lbl.config(text=f"Sukces: {count_total} połączeń.", fg="green")
                 else:
                     status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
-
             except Exception as e:
                 status_lbl.config(text=f"Błąd: {str(e)}", fg="red")
 
         btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white", command=fetch_report)
         btn_fetch.pack(side=tk.LEFT, padx=10)
-
         btn_save = tk.Button(top_frame, text="Zapisz dane (.csv)", bg="#28a745", fg="white", command=save_to_csv)
         btn_save.pack(side=tk.LEFT, padx=10)
 
-    # --- KONIEC NOWEJ FUNKCJI ---
 
     def show_history_window(self):
         hist_win = tk.Toplevel(self.root)
@@ -473,36 +510,26 @@ class AlertClient:
         def refresh_tree_view():
             for item in tree.get_children():
                 tree.delete(item)
-
             sort_key = current_sort_col
-            if sort_key == "timediff":
-                sort_key = "date"
-
-            try:
-                self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
-            except Exception:
-                pass
-
+            if sort_key == "timediff": sort_key = "date"
+            try: self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
+            except: pass
             for row in self.history_data_cache:
                 tree.insert("", tk.END, values=(row['phone'], row['date'], row['timediff'], row['menu']),
                             tags=row['tags'])
 
         def on_header_click(col):
             nonlocal current_sort_col, current_sort_reverse
-            if current_sort_col == col:
-                current_sort_reverse = not current_sort_reverse
+            if current_sort_col == col: current_sort_reverse = not current_sort_reverse
             else:
                 current_sort_col = col
                 current_sort_reverse = True if col in ["date", "timediff"] else False
-
             for c in columns:
                 text = tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
                 tree.heading(c, text=text)
-
             arrow = " ▼" if current_sort_reverse else " ▲"
             current_text = tree.heading(col, "text")
             tree.heading(col, text=current_text + arrow)
-
             refresh_tree_view()
 
         tree.heading("phone", text="Numer Telefonu", command=lambda: on_header_click("phone"))
@@ -523,25 +550,20 @@ class AlertClient:
 
         def on_tree_click(event):
             region = tree.identify_region(event.x, event.y)
-            if region != "cell":
-                return
+            if region != "cell": return
             col_id = tree.identify_column(event.x)
             if col_id == "#1":
                 item_id = tree.identify_row(event.y)
                 if item_id:
                     vals = tree.item(item_id, "values")
-                    if vals:
-                        phone_num = vals[0]
-                        self.copy_number(phone_num)
-
+                    if vals: self.copy_number(vals[0])
         tree.bind("<Button-1>", on_tree_click)
 
         btn_frame = tk.Frame(hist_win)
         btn_frame.pack(fill=tk.X, pady=5, padx=10)
 
         def fetch_data():
-            if not hist_win.winfo_exists():
-                return
+            if not hist_win.winfo_exists(): return
             try:
                 response = requests.get(f"{API_URL}/history", params={"token": Token}, timeout=5)
                 if response.status_code == 200:
@@ -558,32 +580,23 @@ class AlertClient:
                             diff = now - call_time
                             diff_minutes = diff.total_seconds() / 60
                             diff_hours = diff_minutes / 60
-                            if not showing_all and diff_hours > 48:
-                                continue
+                            if not showing_all and diff_hours > 48: continue
                             fmt_timediff = str(diff).split(".")[0]
                             row_tag = "normal"
-                            if diff_minutes < 15:
-                                row_tag = "green"
-                            elif diff_minutes < 30:
-                                row_tag = "orange"
-                            elif diff_minutes < 60:
-                                row_tag = "red"
+                            if diff_minutes < 15: row_tag = "green"
+                            elif diff_minutes < 30: row_tag = "orange"
+                            elif diff_minutes < 60: row_tag = "red"
                             new_cache.append({
-                                'phone': fmt_phone,
-                                'date': raw_date,
-                                'timediff': fmt_timediff,
-                                'menu': log.get("last_menu_full", "-"),
+                                'phone': fmt_phone, 'date': raw_date,
+                                'timediff': fmt_timediff, 'menu': log.get("last_menu_full", "-"),
                                 'tags': (row_tag,)
                             })
                             count_displayed += 1
-                        except Exception:
+                        except:
                             if showing_all:
                                 new_cache.append({
-                                    'phone': fmt_phone,
-                                    'date': raw_date,
-                                    'timediff': "???",
-                                    'menu': log.get("last_menu_full", "-"),
-                                    'tags': ()
+                                    'phone': fmt_phone, 'date': raw_date,
+                                    'timediff': "???", 'menu': log.get("last_menu_full", "-"), 'tags': ()
                                 })
                     self.history_data_cache = new_cache
                     refresh_tree_view()
@@ -595,18 +608,12 @@ class AlertClient:
         def toggle_view():
             nonlocal showing_all
             showing_all = not showing_all
-            if showing_all:
-                btn_toggle.config(text="Pokaż tylko < 48h")
-            else:
-                btn_toggle.config(text="Pokaż wszystko")
+            btn_toggle.config(text="Pokaż tylko < 48h" if showing_all else "Pokaż wszystko")
             fetch_data()
 
         btn_toggle = tk.Button(btn_frame, text="Pokaż wszystko", command=toggle_view, bg="#e1e1e1", width=20)
         btn_toggle.pack(side=tk.LEFT, padx=5)
-
-        tk.Button(btn_frame, text="Zamknij", command=hist_win.destroy, bg="#ffdddd", width=15).pack(side=tk.RIGHT,
-                                                                                                    padx=5)
-
+        tk.Button(btn_frame, text="Zamknij", command=hist_win.destroy, bg="#ffdddd", width=15).pack(side=tk.RIGHT, padx=5)
         fetch_data()
 
     def show_help_window(self):
@@ -620,8 +627,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "(Opis do uzupełnienia, to nie pisze AI :v)\n\n"
-                "Wersja 0.6 [06.02]"
+                "Wersja 0.62 [06.02]"
                 )
 
         if not self.is_admin:
@@ -642,7 +648,6 @@ class AlertClient:
 
         add_legend_row("#007bff", "Niebieski - Dzwoni")
         add_legend_row("#28a745", "Zielony - Odebrane")
-
         tk.Button(help_win, text="Zamknij", command=help_win.destroy, width=15).pack(side=tk.BOTTOM, pady=20)
 
     def on_canvas_configure(self, event):
@@ -653,29 +658,16 @@ class AlertClient:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def filter_alerts(self, all_alerts):
-        # Admin widzi wszystko
-        if self.is_admin:
-            return all_alerts
-
-        # Jeśli użytkownik nie ma przypisanych żadnych AG, nie widzi nic
-        if not self.assigned_ag:
-            return []
-
-        # Zabezpieczenie: upewniamy się, że assigned_ag to lista stringów
-        # (API powinno to gwarantować, ale dla bezpieczeństwa w kliencie):
+        if self.is_admin: return all_alerts
+        if not self.assigned_ag: return []
         allowed_sources = self.assigned_ag
         if not isinstance(allowed_sources, list):
             allowed_sources = [str(allowed_sources)]
-
-        # Konwersja na stringi dla pewności porównania
         allowed_sources = [str(s) for s in allowed_sources]
-
         filtered = []
         for alert in all_alerts:
-            # SPRAWDZENIE: Czy źródło (alert source) znajduje się na liście dozwolonych (allowed_sources)
             if str(alert.get("source")) in allowed_sources:
                 filtered.append(alert)
-
         return filtered
 
     def network_loop(self):
@@ -697,18 +689,61 @@ class AlertClient:
             msg = f"Zalogowano: {self.username}"
             if self.is_admin: msg += " (ADMIN)"
             msg += f" | Widoczne rozmowy: {len(self.active_alerts)}"
-            # Zachowujemy status skopiowania
+            # Nie nadpisuj komunikatu o skopiowaniu
             if "Skopiowano" not in self.status_label.cget("text"):
                 self.status_label.config(text=msg, fg="black")
 
         current_ids = {alert['id'] for alert in self.active_alerts}
         new_alerts = current_ids - self.seen_alert_ids
 
+        # 1. Obsługa wyciągania okna na wierzch (tylko przy nowych połączeniach)
         if new_alerts:
             self.force_window_to_front()
 
+        # 2. LOGIKA DŹWIĘKU (Stanowa: Czy KTOKOLWIEK dzwoni?)
+        # Sprawdzamy, czy na liście jest chociaż jedno połączenie ze statusem CALLING
+        any_calling = False
+        for alert in self.active_alerts:
+            status = alert.get("status")
+            # Zakładamy, że status to "CALLING". Czasem API zwraca puste lub None dla dzwoniących,
+            # więc warto obsłużyć też ten przypadek, jeśli jest taki w Twoim systemie.
+            if status == "MOH":
+                any_calling = True
+                break
+
+        if self.sound_enabled.get() and winsound:
+            # SYTUACJA A: Ktoś dzwoni, a my jeszcze nie gramy dźwięku -> START PĘTLI
+            if any_calling and not self.is_sound_playing:
+                sound_file = "sound.wav"
+                try:
+                    if os.path.exists(sound_file):
+                        # SND_LOOP - pętla, SND_ASYNC - nie blokuj programu
+                        winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                    else:
+                        # Fallback systemowy (SystemHand zazwyczaj nie pętli się dobrze z aliasem, ale to awaryjne)
+                        winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_LOOP)
+
+                    self.is_sound_playing = True
+                except Exception as e:
+                    print(f"Błąd startu dźwięku: {e}")
+
+            # SYTUACJA B: Nikt nie dzwoni (wszyscy ANSWERED lub pusta lista), a dźwięk gra -> STOP
+            elif not any_calling and self.is_sound_playing:
+                try:
+                    # Zatrzymanie dźwięku
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    self.is_sound_playing = False
+                except Exception as e:
+                    print(f"Błąd zatrzymania dźwięku: {e}")
+
+        # Jeśli użytkownik wyłączył dźwięk w checkboxie w trakcie dzwonienia, też ucisz
+        if not self.sound_enabled.get() and self.is_sound_playing:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            self.is_sound_playing = False
+
         self.seen_alert_ids = current_ids
 
+        # Aktualizacja listy w GUI (tylko jeśli dane się zmieniły)
         if self.active_alerts != self.last_data_snapshot:
             if len(self.active_alerts) > 0:
                 self.idle_frame.pack_forget()
@@ -730,7 +765,6 @@ class AlertClient:
     def refresh_alerts_list(self):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
-
         for alert in self.active_alerts:
             self.create_alert_widget(alert)
 
@@ -743,18 +777,13 @@ class AlertClient:
             return f"{p[:3]} {p[3:6]} {p[6:]}"
         return phone
 
-    # --- KOPIOWANIE DO SCHOWKA ---
     def copy_number(self, number):
-        if not number:
-            return
+        if not number: return
         self.root.clipboard_clear()
         self.root.clipboard_append(number)
         self.root.update()
-
-        # Potwierdzenie na pasku statusu
         original_bg = self.status_label.cget("bg")
         self.status_label.config(text=f"✅ Skopiowano do schowka: {number}", bg="#d4edda")
-
         self.root.after(3000, lambda: self.status_label.config(bg=original_bg))
 
     def create_alert_widget(self, alert_data):
@@ -763,63 +792,42 @@ class AlertClient:
 
         raw_caller = alert_data.get('caller', 'Nieznany')
         caller = self.format_phone_number(raw_caller)
-
-        # Pobieramy dane
         target = alert_data.get('agent_name') or alert_data.get('source', 'Infolinia')
         menu = alert_data.get('menu_name')
         status = alert_data.get('status') or "Dzwoni..."
 
-        # --- ZMIANA: Usuwanie cyfr dla zwykłego użytkownika ---
         if not self.is_admin:
-            # Usuwamy cyfry z nazwy Agenta/Targetu
             target = re.sub(r'\d+', '', str(target)).strip()
-            # Usuwamy ewentualne myślniki na początku (np. z "805 - Jan" zostaje "- Jan")
             target = target.lstrip('- ').strip()
-
             if menu:
-                # Usuwamy cyfry z Menu
                 menu = re.sub(r'\d+', '', str(menu)).strip()
-                # Kosmetyka menu (np. z "1 - Sprzedaż" zostaje "- Sprzedaż")
                 menu = menu.lstrip('- ').strip()
-        # -----------------------------------------------------
 
         status_color = "#007bff"
-        if status in ["ANSWERED", "Odebrane"]:
-            status_color = "#28a745"
-        elif status in ["BUSY", "Zajęte", "Rozłączono"]:
-            status_color = "#dc3545"
+        if status in ["ANSWERED", "Odebrane"]: status_color = "#28a745"
+        elif status in ["BUSY", "Zajęte", "Rozłączono"]: status_color = "#dc3545"
 
         tk.Frame(frame, bg=status_color, height=5).pack(fill=tk.X)
-
         content = tk.Frame(frame, bg="white", padx=10, pady=5)
         content.pack(fill=tk.BOTH, expand=True)
-
         header_frame = tk.Frame(content, bg="white")
         header_frame.pack(anchor="w", fill=tk.X)
 
-        # Klikalny numer w oknie głównym
         lbl_phone = tk.Label(header_frame, text=f"📞 {caller}", font=("Arial", 14, "bold"),
                              bg="white", fg="black", cursor="hand2")
         lbl_phone.pack(side=tk.LEFT)
         lbl_phone.bind("<Button-1>", lambda e: self.copy_number(caller))
-
         tk.Label(header_frame, text=f" ➔ {target}", font=("Arial", 14, "bold"),
                  bg="white", fg="#555").pack(side=tk.LEFT)
-
         if menu:
-            tk.Label(content, text=f"📂 {menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(
-                anchor="w")
+            tk.Label(content, text=f"📂 {menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(anchor="w")
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
-
-
     def start_main_app(username, is_admin, assigned_ag):
         root.deiconify()
         app = AlertClient(root, username, is_admin, assigned_ag)
-
-
     LoginWindow(root, start_main_app)
     root.mainloop()
