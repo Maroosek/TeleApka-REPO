@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -23,6 +23,7 @@ try:
     collection_users_name = MongoCredentials.COLLECTION_USERS
     collection_logs_name = MongoCredentials.COLLECTION_HISTORY
     collection_sms_name = MongoCredentials.COLLECTION_SMS
+    collection_stats_name = MongoCredentials.COLLECTION_STATS
     GLOBAL_ACCESS_TOKEN = MongoCredentials.GLOBAL_ACCESS_TOKEN
     port = int(os.getenv("PORT", 8020))
 except ImportError:
@@ -31,6 +32,7 @@ except ImportError:
     collection_name = os.getenv("COLLECTION_NAME", "alerts")
     collection_users_name = os.getenv("COLLECTION_USERS", "user")
     collection_logs_name = os.getenv("COLLECTION_HISTORY", "history")
+    collection_stats_name = os.getenv("COLLECTION_STATS", "stats")
     collection_sms_name = os.getenv("COLLECTION_SMS", "smsReceived")
     GLOBAL_ACCESS_TOKEN = os.getenv("GLOBAL_ACCESS_TOKEN", "admin123")
     port = int(os.getenv("PORT", 8020))
@@ -41,12 +43,13 @@ collection = None
 collection_users = None
 collection_logs = None
 collection_sms = None
+collection_stats = None
 
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, collection, collection_users, collection_logs, collection_sms
+    global client, collection, collection_users, collection_logs, collection_sms, collection_stats
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
 
     try:
@@ -57,6 +60,7 @@ async def lifespan(app: FastAPI):
         collection_users = db[collection_users_name]
         collection_logs = db[collection_logs_name]
         collection_sms = db[collection_sms_name]
+        collection_stats = db[collection_stats_name]
 
         print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
 
@@ -136,7 +140,6 @@ class HistoryResponse(BaseModel):
     count: int
     logs: List[LogEntrySchema]
 
-
 # --- ENDPOINTY ---
 
 @app.get("/")
@@ -202,6 +205,89 @@ async def get_status():
         "count": len(mapped_alerts),
         "alerts": mapped_alerts
     }
+
+
+@app.post("/stats", status_code=201)
+async def add_stats(payload: dict = Body(...)):
+    """
+    Zapisuje raport statystyczny.
+    Wymaga, aby w JSON-ie znajdowało się pole 'date' (format YYYY-MM-DD),
+    które posłuży do późniejszego filtrowania.
+    """
+    if collection_stats is None:
+        raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
+
+    # Sprawdź, czy klient przesłał datę, po której będziemy filtrować
+    # Jeśli w JSON wysyłasz klucz "data" (po polsku), zmień poniżej "date" na "data"
+    if "date" not in payload:
+        raise HTTPException(status_code=400, detail="Brak pola 'date' (YYYY-MM-DD) w przesłanym JSON.")
+
+    try:
+        # Opcjonalnie: dodajemy timestamp wpłynięcia rekordu (techniczny)
+        payload["_created_at"] = datetime.now()
+
+        # Zapis do bazy
+        # Jeśli chcesz nadpisywać statystyki dla danego dnia, użyj update_one z upsert=True
+        # Tutaj robimy insert_one (każdy wysłany raport to nowy dokument)
+        result = await collection_stats.insert_one(payload)
+
+        return {"status": "saved", "id": str(result.inserted_id)}
+    except Exception as e:
+        print(f"❌ Błąd zapisu statystyk: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+async def get_stats(
+        date_from: str = Query(..., description="Data początkowa (YYYY-MM-DD)", example="2026-02-01"),
+        date_to: str = Query(..., description="Data końcowa (YYYY-MM-DD)", example="2026-02-28"),
+        token: str = Query(..., description="Token administratora")
+):
+    """
+    Pobiera statystyki z zakresu dat.
+    Filtruje po polu 'date' wewnątrz dokumentów JSON.
+    """
+    # 1. Autoryzacja
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
+
+    if collection_stats is None:
+        raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
+
+    try:
+        # 2. Budowanie zapytania do Mongo
+        # Szukamy w polu "date" (lub "data" jeśli tak nazwałeś w POST)
+        # Format YYYY-MM-DD pozwala na porównywanie stringów ($gte, $lte)
+        query = {
+            "date": {
+                "$gte": date_from,
+                "$lte": date_to
+            }
+        }
+
+        # 3. Pobranie danych (sortowanie rosnąco po dacie)
+        cursor = collection_stats.find(query).sort("date", 1)
+        stats_docs = await cursor.to_list(length=None)
+
+        # 4. Mapowanie (usuwanie _id, konwersja na czysty JSON)
+        mapped_stats = []
+        for doc in stats_docs:
+            doc["id"] = str(doc.pop("_id"))
+            # Usuwamy techniczny timestamp, jeśli nie jest potrzebny klientowi
+            if "_created_at" in doc:
+                del doc["_created_at"]
+            mapped_stats.append(doc)
+
+        return {
+            "count": len(mapped_stats),
+            "date_from": date_from,
+            "date_to": date_to,
+            "data": mapped_stats
+        }
+
+    except Exception as e:
+        print(f"❌ Błąd odczytu statystyk: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/telestrada/connections")

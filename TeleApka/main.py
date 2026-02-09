@@ -206,17 +206,18 @@ class AlertClient:
         if messagebox.askyesno("Zamykanie", "Czy na pewno chcesz zamknąć monitor połączeń?"):
             self.root.destroy()
 
-
     def show_report_window(self):
         rep_win = tk.Toplevel(self.root)
-        rep_win.title("Wykaz dzienny - Podsumowanie")
-        rep_win.geometry("750x500")
+        rep_win.title("Wykaz dzienny - Grupowanie wg Branż + Anulowane")
+        rep_win.geometry("900x600")
 
         # --- ZMIENNE STANU ---
         current_report_data = None
-        var_detailed = tk.BooleanVar(value=False)  # Domyślnie zwinięte (widok ogólny)
-        current_sort_col = "#0"  # Domyślne sortowanie po kolumnie drzewa (Firma)
-        current_sort_reverse = False  # Domyślnie A-Z
+        var_expand_groups = tk.BooleanVar(value=False)
+
+        # Zmienne do sortowania
+        self.sort_col = "#0"
+        self.sort_reverse = False
 
         # Pasek górny
         top_frame = tk.Frame(rep_win, pady=10, padx=10, bg="#f8f9fa")
@@ -233,24 +234,30 @@ class AlertClient:
         tree_frame = tk.Frame(rep_win)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # ZMIANA: Definicja kolumn - "Firma" jest teraz w kolumnie #0 (drzewo)
-        columns = ("typ", "ilosc")
-        # show="tree headings" pokazuje kolumnę #0 (drzewo) oraz nagłówki pozostałych
+        # Definicja wszystkich kolumn danych
+        columns = ("typ", "total", "cancelled")
         tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
 
-        # Konfiguracja kolumny drzewa (#0)
-        tree.heading("#0", text="Firma (Słowo kluczowe)", anchor=tk.W)
-        tree.column("#0", width=250, anchor=tk.W)
+        # Konfiguracja kolumn
+        tree.heading("#0", text="Firma / Źródło", anchor=tk.W, command=lambda: sort_tree("#0"))
+        tree.column("#0", width=300, anchor=tk.W)
 
-        # Konfiguracja pozostałych kolumn
-        tree.heading("typ", text="Typ")
+        tree.heading("typ", text="Pełna nazwa / Numer", anchor=tk.W, command=lambda: sort_tree("typ"))
         tree.column("typ", width=250, anchor=tk.W)
 
-        tree.heading("ilosc", text="Ilość Połączeń")
-        tree.column("ilosc", width=100, anchor=tk.CENTER)
+        tree.heading("total", text="Wszystkie", anchor=tk.CENTER, command=lambda: sort_tree("total"))
+        tree.column("total", width=80, anchor=tk.CENTER)
 
-        # Tagi stylów
-        tree.tag_configure("total_row", font=("Arial", 10, "bold"), background="#e8e8e8")
+        tree.heading("cancelled", text="Anulowane (Klient <15s)", anchor=tk.CENTER,
+                     command=lambda: sort_tree("cancelled"))
+        tree.column("cancelled", width=150, anchor=tk.CENTER)
+
+        # Domyślnie ukrywamy kolumnę cancelled (bo checkbox jest False na start)
+        tree["displaycolumns"] = ("typ", "total")
+
+        # Style wierszy
+        tree.tag_configure("company_row", font=("Arial", 11, "bold"), background="#e1e1e1")
+        tree.tag_configure("group_row", font=("Arial", 10, "bold"), background="#f4f4f4")
         tree.tag_configure("detail_row", font=("Arial", 9), background="white")
 
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -262,139 +269,253 @@ class AlertClient:
         status_lbl = tk.Label(rep_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
         status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # --- FUNKCJA RENDERUJĄCA (ZMODYFIKOWANA) ---
+        # --- FUNKCJA SORTUJĄCA ---
+        def sort_tree(col):
+            if self.sort_col == col:
+                self.sort_reverse = not self.sort_reverse
+            else:
+                self.sort_col = col
+                self.sort_reverse = False
+
+            # Reset nagłówków
+            for c in ["#0", "typ", "total", "cancelled"]:
+                clean_text = tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
+                tree.heading(c, text=clean_text)
+
+            arrow = " ▼" if self.sort_reverse else " ▲"
+            current_text = tree.heading(col, "text")
+            tree.heading(col, text=current_text + arrow)
+            render_tree()
+
+        # --- FUNKCJA RENDERUJĄCA ---
         def render_tree():
-            # Czyścimy drzewo
+            # 1. Zarządzanie widocznością kolumn
+            show_details = var_expand_groups.get()
+            if show_details:
+                tree["displaycolumns"] = ("typ", "total", "cancelled")
+            else:
+                tree["displaycolumns"] = ("typ", "total")
+
+            # 2. Czyszczenie drzewa
             for item in tree.get_children():
                 tree.delete(item)
 
             if not current_report_data:
                 return
 
-            # Stan checkboxa decyduje czy drzewo jest domyślnie rozwinięte
-            expand_all = var_detailed.get()
+            # Helper do sortowania
+            def get_sort_key(item_tuple):
+                key, val = item_tuple
+                if isinstance(val, dict) and 'total' in val:  # Detal
+                    t, c = val['total'], val['cancelled']
+                else:  # Grupa/Firma - sumowanie rekurencyjne
+                    t, c = 0, 0
+                    if isinstance(val, dict):
+                        for sub_k, sub_v in val.items():
+                            if isinstance(sub_v, dict) and 'total' in sub_v:
+                                t += sub_v['total']
+                                c += sub_v['cancelled']
+                            elif isinstance(sub_v, dict):
+                                for d_v in sub_v.values():
+                                    t += d_v['total']
+                                    c += d_v['cancelled']
 
-            companies = list(current_report_data.keys())
+                if self.sort_col == "total": return t
+                if self.sort_col == "cancelled": return c
+                if self.sort_col == "typ": return key
+                return key.lower()
 
-            # Sortowanie głównych węzłów (Firm)
-            if current_sort_col == "#0":  # Sortowanie po nazwie firmy
-                companies.sort(reverse=current_sort_reverse)
-            elif current_sort_col == "ilosc":  # Sortowanie po ilości całkowitej
-                companies.sort(key=lambda x: current_report_data[x]["Wszystkie"], reverse=current_sort_reverse)
+            # Budowanie drzewa
+            companies_items = list(current_report_data.items())
+            companies_items.sort(key=get_sort_key, reverse=self.sort_reverse)
 
-            for company in companies:
-                types = current_report_data[company]
-                total_count = types["Wszystkie"]
+            for company, groups_dict in companies_items:
+                comp_total = 0
+                comp_cancelled = 0
+                for g_details in groups_dict.values():
+                    for d_stats in g_details.values():
+                        comp_total += d_stats['total']
+                        comp_cancelled += d_stats['cancelled']
 
-                # 1. Wstawiamy RODZICA (Firmę - Podsumowanie)
-                # text=company wstawia nazwę w kolumnę #0 (tę ze strzałką)
-                parent_id = tree.insert(
-                    "",
-                    tk.END,
-                    text=company,
-                    values=("Wszystkie (Podsumowanie)", total_count),
-                    tags=("total_row",),
-                    open=expand_all  # Tutaj decydujemy czy rozwinięte
+                company_id = tree.insert(
+                    "", tk.END, text=f"{company}",
+                    values=("Podsumowanie Firmy", comp_total, comp_cancelled),
+                    tags=("company_row",), open=True
                 )
 
-                # 2. Wstawiamy DZIECI (Szczegóły) - zawsze są w strukturze, widoczność zależy od 'open' rodzica
-                subtypes = sorted([t for t in types.keys() if t != "Wszystkie"])
-                for t_name in subtypes:
-                    count = types[t_name]
-                    # Wstawiamy jako dziecko 'parent_id'
-                    tree.insert(
-                        parent_id,
-                        tk.END,
-                        text="",  # Puste w kolumnie drzewa
-                        values=(t_name, count),
-                        tags=("detail_row",)
+                groups_items = list(groups_dict.items())
+                groups_items.sort(key=get_sort_key, reverse=self.sort_reverse)
+
+                for group_name, details_dict in groups_items:
+                    group_total = 0
+                    group_cancelled = 0
+                    for d_stats in details_dict.values():
+                        group_total += d_stats['total']
+                        group_cancelled += d_stats['cancelled']
+
+                    group_id = tree.insert(
+                        company_id, tk.END, text=f"  ↳ {group_name}",
+                        values=("Zsumowane źródło", group_total, group_cancelled),
+                        tags=("group_row",), open=show_details
                     )
 
-        # --- OBSŁUGA NAGŁÓWKÓW (SORTOWANIE) ---
-        def on_header_click(col):
-            nonlocal current_sort_col, current_sort_reverse
-            if current_sort_col == col:
-                current_sort_reverse = not current_sort_reverse
-            else:
-                current_sort_col = col
-                # Domyślnie malejąco dla ilości, rosnąco dla tekstu
-                current_sort_reverse = True if col == "ilosc" else False
+                    # Detale
+                    details_items = list(details_dict.items())
+                    det_sort_col = self.sort_col if self.sort_col != "#0" else "typ"
 
-            # Odświeżanie strzałek w nagłówkach
-            headers = {"#0": "Firma (Słowo kluczowe)", "typ": "Typ", "ilosc": "Ilość Połączeń"}
+                    def detail_sort_key(itm):
+                        k, v = itm
+                        if det_sort_col == "total": return v['total']
+                        if det_sort_col == "cancelled": return v['cancelled']
+                        return k.lower()
 
-            # Reset nagłówków
-            for key, val in headers.items():
-                tree.heading(key, text=val)
+                    details_items.sort(key=detail_sort_key, reverse=self.sort_reverse)
 
-            # Ustawienie strzałki na aktywnym
-            arrow = " ▼" if current_sort_reverse else " ▲"
-            base_text = headers.get(col, col)
-            tree.heading(col, text=base_text + arrow)
+                    for raw_name, stats in details_items:
+                        tree.insert(
+                            group_id, tk.END, text="",
+                            values=(raw_name, stats['total'], stats['cancelled']),
+                            tags=("detail_row",)
+                        )
 
-            render_tree()
-
-        # Przypisanie komend sortowania
-        tree.heading("#0", command=lambda: on_header_click("#0"))
-        tree.heading("typ", command=lambda: on_header_click(
-            "typ"))  # Sortowanie po typie wewnątrz firmy niezaimplementowane globalnie, ale nagłówek zostawiamy
-        tree.heading("ilosc", command=lambda: on_header_click("ilosc"))
-
-        # Checkbox "Rozwiń wszystko" (zmieniłem nazwę dla jasności, ale logika ta sama)
-        cb_detailed = tk.Checkbutton(top_frame, text="Rozwiń szczegóły domyślnie",
-                                     variable=var_detailed, bg="#f8f9fa",
-                                     command=render_tree)
-        cb_detailed.pack(side=tk.LEFT, padx=15)
-
-        # --- EXPORT DO CSV (ZMODYFIKOWANY DLA STRUKTURY DRZEWA) ---
+        # --- EXPORT DO CSV ---
         def save_to_csv():
-            # Sprawdzamy czy są jakiekolwiek korzenie (firmy)
-            if not tree.get_children():
+            if not current_report_data:
                 messagebox.showwarning("Brak danych", "Najpierw pobierz dane.")
                 return
 
-            date_str = entry_date.get().strip() or "nieznana-data"
-            default_filename = f"Wykaz {date_str}"
+            date_str = entry_date.get().strip() or "raport"
+            export_details = var_expand_groups.get()
+            suffix = "szczegoly" if export_details else "ogolny"
 
             path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
-                initialfile=default_filename,
-                filetypes=[("Plik CSV", "*.csv"), ("Wszystkie pliki", "*.*")],
-                title="Zapisz raport jako"
+                initialfile=f"Raport_{date_str}_{suffix}",
+                filetypes=[("Plik CSV", "*.csv")]
             )
             if not path: return
 
             try:
                 with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f, delimiter=';')
-                    writer.writerow(["Firma", "Typ", "Ilość"])
 
-                    # Iterujemy po głównych węzłach (Firmach)
-                    for parent_id in tree.get_children():
-                        # Pobieramy dane rodzica
-                        parent_text = tree.item(parent_id)["text"]  # Nazwa firmy z kolumny #0
-                        parent_vals = tree.item(parent_id)["values"]  # [Typ, Ilość]
+                    headers = ["Firma", "Grupa/Branża", "Opis / Numer", "Ilość Całkowita"]
+                    if export_details:
+                        headers.append("Anulowane (Klient <15s)")
 
-                        # Zapisujemy wiersz podsumowania
-                        writer.writerow([parent_text, parent_vals[0], parent_vals[1]])
+                    writer.writerow(headers)
 
-                        # Iterujemy po dzieciach (szczegółach) tego rodzica
-                        for child_id in tree.get_children(parent_id):
-                            child_vals = tree.item(child_id)["values"]  # [Typ, Ilość]
-                            # Zapisujemy wiersz szczegółowy (powtarzamy nazwę firmy dla czytelności CSV)
-                            writer.writerow([parent_text, child_vals[0], child_vals[1]])
+                    for company in sorted(current_report_data.keys()):
+                        groups = current_report_data[company]
+                        for group_name in sorted(groups.keys()):
+                            details = groups[group_name]
+
+                            g_total = 0
+                            g_cancelled = 0
+                            for d in details.values():
+                                g_total += d['total']
+                                g_cancelled += d['cancelled']
+
+                            row_data = [company, group_name, "(SUMA GRUPY)", g_total]
+                            if export_details:
+                                row_data.append(g_cancelled)
+
+                            writer.writerow(row_data)
+
+                            if export_details:
+                                for raw_name, stats in details.items():
+                                    writer.writerow(
+                                        [company, group_name, raw_name, stats['total'], stats['cancelled']])
 
                 status_lbl.config(text=f"Zapisano: {path}", fg="green")
             except Exception as e:
                 messagebox.showerror("Błąd", f"Nie udało się zapisać: {e}")
 
-        # --- LOGIKA POBIERANIA DANYCH (BEZ ZMIAN W LOGICE, TYLKO RE-RENDER) ---
+        # --- FUNKCJA ZAPISU DO BAZY Z WALIDACJĄ DATY ---
+        def save_to_db():
+            if not current_report_data:
+                messagebox.showwarning("Brak danych", "Najpierw pobierz dane.")
+                return
+
+            date_val = entry_date.get().strip()
+            if not date_val:
+                messagebox.showwarning("Błąd", "Brak daty.")
+                return
+
+            # 1. SPRAWDZENIE CZY DATA ISTNIEJE W BAZIE
+            try:
+                status_lbl.config(text="Sprawdzanie duplikatów...", fg="blue")
+                rep_win.update()
+
+                # Używamy istniejącego endpointu GET /stats do sprawdzenia
+                check_params = {
+                    "date_from": date_val,
+                    "date_to": date_val,
+                    "token": Token
+                }
+
+                check_response = requests.get(f"{API_URL}/stats", params=check_params, timeout=5)
+
+                if check_response.status_code == 200:
+                    existing_data = check_response.json()
+                    count = existing_data.get("count", 0)
+
+                    if count > 0:
+                        # Pytamy użytkownika o decyzję
+                        msg = (f"W bazie danych znaleziono już wpisy ({count}) dla daty {date_val}.\n\n"
+                               "Czy chcesz dodać kolejny raport dla tej daty?")
+                        if not messagebox.askyesno("Duplikat daty", msg):
+                            status_lbl.config(text="Anulowano przez użytkownika.", fg="orange")
+                            return
+                else:
+                    print(f"Błąd sprawdzania duplikatów: {check_response.status_code}")
+                    # Opcjonalnie: można tu przerwać, ale pozwalamy iść dalej w razie błędu sieci przy odczycie
+
+            except Exception as e:
+                print(f"Błąd połączenia przy sprawdzaniu: {e}")
+
+            # 2. BUDOWANIE PAYLOADU (SUMOWANIE GRUP)
+            payload = {
+                "date": date_val
+            }
+
+            for company, groups in current_report_data.items():
+                for group_name, details in groups.items():
+
+                    # Sumujemy 'total' ze wszystkich szczegółów w danej grupie
+                    group_total = 0
+                    for stats in details.values():
+                        group_total += stats['total']
+
+                    # Klucz ogólny: "Firma - Grupa"
+                    key = f"{company.capitalize()} - {group_name}"
+                    payload[key] = group_total
+
+            # 3. WYSŁANIE DANYCH (POST)
+            try:
+                status_lbl.config(text="Wysyłanie do bazy...", fg="blue")
+                rep_win.update()
+
+                response = requests.post(f"{API_URL}/stats", json=payload, timeout=5)
+
+                if response.status_code == 200 or response.status_code == 201:
+                    status_lbl.config(text="Zapisano w bazie!", fg="green")
+                    messagebox.showinfo("Sukces", "Raport został zapisany w bazie danych.")
+                else:
+                    status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
+                    messagebox.showerror("Błąd API",
+                                         f"Serwer zwrócił błąd: {response.status_code}\n{response.text}")
+
+            except Exception as e:
+                status_lbl.config(text="Błąd połączenia", fg="red")
+                messagebox.showerror("Błąd", f"Nie udało się wysłać danych: {e}")
+
+        # --- LOGIKA POBIERANIA DANYCH ---
         def fetch_report():
             nonlocal current_report_data
             date_val = entry_date.get().strip()
-            if not date_val:
-                messagebox.showwarning("Błąd", "Wpisz datę.")
-                return
+            if not date_val: return
+
             status_lbl.config(text="Pobieranie...", fg="blue")
             rep_win.update()
 
@@ -409,7 +530,7 @@ class AlertClient:
 
             try:
                 url = f"{API_URL}/telestrada/connections"
-                response = requests.get(url, params={"date": date_val, "token": Token})
+                response = requests.get(url, params={"date": date_val, "token": Token}, timeout=10)
 
                 if response.status_code == 200:
                     data = response.json()
@@ -417,14 +538,8 @@ class AlertClient:
                     if isinstance(data, list):
                         connections = data
                     elif isinstance(data, dict):
-                        if "connections" in data:
-                            connections = data["connections"]
-                        else:
-                            for key, val in data.items():
-                                if isinstance(val, list) and len(val) > 0:
-                                    connections = val
-                                    break
-                            if not connections: connections = list(data.values())
+                        connections = data.get("connections") or next((v for v in data.values() if isinstance(v, list)),
+                                                                      [])
 
                     if not connections:
                         status_lbl.config(text="Brak danych.", fg="orange")
@@ -432,7 +547,7 @@ class AlertClient:
                         render_tree()
                         return
 
-                    stats = defaultdict(lambda: defaultdict(int))
+                    stats = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {"total": 0, "cancelled": 0})))
                     count_total = 0
 
                     for conn in connections:
@@ -442,34 +557,48 @@ class AlertClient:
 
                         count_total += 1
                         menu_full = menu_full.strip()
-                        try:
-                            duration = int(conn.get("billsec", 0))
-                        except:
-                            duration = 0
 
-                        company_name = ""
-                        type_name = ""
+                        if "lider beton" in menu_full.lower() and " - " not in menu_full:
+                            menu_full = re.sub(r'(?i)^(lider\s?beton)(\s+)', r'\1 - ', menu_full)
+
                         if " - " in menu_full:
                             parts = menu_full.split(" - ", 1)
                             company_name = parts[0].strip().lower()
-                            type_name = parts[1].strip()
+                            raw_type_name = parts[1].strip()
                         else:
-                            check_digits = menu_full.replace(" ", "")
-                            if len(check_digits) >= 9 and check_digits[-9:].isdigit():
+                            check = menu_full.replace(" ", "")
+                            if len(check) >= 9 and check[-9:].isdigit():
                                 company_name = menu_full[:-9].strip().lower()
                             else:
                                 company_name = menu_full.strip().lower()
-                            ivr_number = conn.get("ivr_phone_number", "brak_ivr")
-                            type_name = f"Inne/Brak - {ivr_number}"
+                            raw_type_name = f"{menu_full.replace(company_name, '').strip()}" or "Inne"
 
                         if company_name in NAME_CORRECTIONS: company_name = NAME_CORRECTIONS[company_name]
-                        if not company_name: company_name = "nieznana firma"
-                        if duration < 7: type_name = f"{type_name} (Mniej niż 7s)"
 
-                        stats[company_name][type_name] += 1
-                        stats[company_name]["Wszystkie"] += 1
+                        group_name = re.sub(r'[\s]*\d[\d\s-]{5,}\d$', '', raw_type_name).strip().strip("- ").strip()
+                        if group_name.lower() in ["wizytówki w kampanii",
+                                                  "wizytówki kampania"]: group_name = "wizytówki kampania"
+                        if not group_name: group_name = "Inne / Bezpośrednie"
+
+                        # --- ZLICZANIE ---
+                        entry = stats[company_name][group_name][raw_type_name]
+                        entry['total'] += 1
+
+                        try:
+                            raw_billsec = conn.get("billsec")
+                            billsec = int(raw_billsec or 0)
+                        except (ValueError, TypeError):
+                            billsec = 0
+
+                        disc_side = str(conn.get("disconnect_side") or "B").upper()
+
+                        if billsec < 15 and disc_side == 'A':
+                            entry['cancelled'] += 1
+                        # --------------------------------------
 
                     current_report_data = stats
+                    self.sort_col = "#0"
+                    self.sort_reverse = False
                     render_tree()
                     status_lbl.config(text=f"Sukces: {count_total} połączeń.", fg="green")
                 else:
@@ -477,10 +606,20 @@ class AlertClient:
             except Exception as e:
                 status_lbl.config(text=f"Błąd: {str(e)}", fg="red")
 
+        # Przyciski
         btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white", command=fetch_report)
         btn_fetch.pack(side=tk.LEFT, padx=10)
-        btn_save = tk.Button(top_frame, text="Zapisz dane (.csv)", bg="#28a745", fg="white", command=save_to_csv)
+
+        btn_save = tk.Button(top_frame, text="Zapisz CSV", bg="#28a745", fg="white", command=save_to_csv)
         btn_save.pack(side=tk.LEFT, padx=10)
+
+        # NOWY PRZYCISK ZAPISU DO BAZY
+        btn_db = tk.Button(top_frame, text="Zapisz do Bazy", bg="#17a2b8", fg="white", command=save_to_db)
+        btn_db.pack(side=tk.LEFT, padx=10)
+
+        cb_expand = tk.Checkbutton(top_frame, text="Rozwijaj szczegóły",
+                                   variable=var_expand_groups, bg="#f8f9fa", command=render_tree)
+        cb_expand.pack(side=tk.LEFT, padx=20)
 
 
     def show_history_window(self):
@@ -627,7 +766,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.62 [06.02]"
+                "Wersja 0.63 [09.02]"
                 )
 
         if not self.is_admin:

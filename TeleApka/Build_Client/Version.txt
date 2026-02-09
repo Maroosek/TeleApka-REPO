@@ -31,12 +31,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'Jena Europa'),
         StringStruct('FileDescription', 'Monitor połączeń Jena Europa.'),
-        StringStruct('FileVersion', '0.6.0.0'),
+        StringStruct('FileVersion', '0.6.3.0'),
         StringStruct('InternalName', 'Monitor JET'),
         StringStruct('LegalCopyright', 'Jena Europa. All rights reserved.'),
         StringStruct('OriginalFilename', 'MonitorJET.exe'),
         StringStruct('ProductName', 'MonitorJET'),
-        StringStruct('ProductVersion', '0.6.0.0')])
+        StringStruct('ProductVersion', '0.6.3.0')])
       ]), 
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
