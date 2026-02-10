@@ -24,6 +24,7 @@ try:
     collection_logs_name = MongoCredentials.COLLECTION_HISTORY
     collection_sms_name = MongoCredentials.COLLECTION_SMS
     collection_stats_name = MongoCredentials.COLLECTION_STATS
+    collection_stats_data_name = MongoCredentials.COLLECTION_STATS_DATA
     GLOBAL_ACCESS_TOKEN = MongoCredentials.GLOBAL_ACCESS_TOKEN
     port = int(os.getenv("PORT", 8020))
 except ImportError:
@@ -33,6 +34,7 @@ except ImportError:
     collection_users_name = os.getenv("COLLECTION_USERS", "user")
     collection_logs_name = os.getenv("COLLECTION_HISTORY", "history")
     collection_stats_name = os.getenv("COLLECTION_STATS", "stats")
+    collection_stats_data_name = os.getenv("COLLECTION_STATS_DATA", "statsData")
     collection_sms_name = os.getenv("COLLECTION_SMS", "smsReceived")
     GLOBAL_ACCESS_TOKEN = os.getenv("GLOBAL_ACCESS_TOKEN", "admin123")
     port = int(os.getenv("PORT", 8020))
@@ -44,12 +46,13 @@ collection_users = None
 collection_logs = None
 collection_sms = None
 collection_stats = None
+collection_stats_data = None
 
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, collection, collection_users, collection_logs, collection_sms, collection_stats
+    global client, collection, collection_users, collection_logs, collection_sms, collection_stats, collection_stats_data
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
 
     try:
@@ -61,6 +64,7 @@ async def lifespan(app: FastAPI):
         collection_logs = db[collection_logs_name]
         collection_sms = db[collection_sms_name]
         collection_stats = db[collection_stats_name]
+        collection_stats_data = db[collection_stats_data_name]
 
         print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
 
@@ -287,6 +291,41 @@ async def get_stats(
 
     except Exception as e:
         print(f"❌ Błąd odczytu statystyk: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats-data")
+async def get_stats_data_list(token: str = Query(..., description="Token administratora")):
+    """
+    Pobiera dane konfiguracyjne do statystyk (np. listy numerów, kategorie)
+    z kolekcji stats_data.
+    """
+    # 1. Autoryzacja
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
+
+    # 2. Sprawdzenie połączenia z bazą
+    if collection_stats_data is None:
+        raise HTTPException(status_code=503, detail="Brak bazy danych stats_data")
+
+    try:
+        # 3. Pobranie wszystkich dokumentów
+        cursor = collection_stats_data.find({})
+        docs = await cursor.to_list(length=None)
+
+        mapped_data = []
+        for doc in docs:
+            # Zamiana ObjectId na string, aby był poprawny JSON
+            doc["id"] = str(doc.pop("_id"))
+            mapped_data.append(doc)
+
+        return {
+            "count": len(mapped_data),
+            "data": mapped_data
+        }
+
+    except Exception as e:
+        print(f"❌ Błąd odczytu stats_data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

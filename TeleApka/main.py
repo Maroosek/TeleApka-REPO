@@ -8,7 +8,7 @@ import copy
 import csv
 import re
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 # --- ZMIANA 1: Import biblioteki dźwiękowej (Windows) ---
@@ -18,7 +18,7 @@ except ImportError:
     winsound = None  # Fallback dla systemów innych niż Windows
 
 # Konfiguracja
-#API_URL = "http://192.168.18.8:8020"
+# API_URL = "http://192.168.18.8:8020"
 API_URL = "http://64.225.111.62:8020"
 POLL_INTERVAL = 1
 Token = "H4d98da91ji9DSAXm11"
@@ -96,7 +96,7 @@ class AlertClient:
         self.is_admin = is_admin
         self.assigned_ag = assigned_ag
 
-        # Tytuł okna (tutaj zostawiamy po przecinku, żeby nie rozciągać paska tytułu)
+        # Tytuł okna
         if isinstance(self.assigned_ag, list):
             ag_title_str = ", ".join(map(str, self.assigned_ag))
         else:
@@ -136,19 +136,11 @@ class AlertClient:
                                   command=self.show_help_window)
         self.help_btn.pack(side=tk.RIGHT, padx=2, pady=1)
 
-        # --- ZMIANA 2 i 3: Checkbox dźwięku i logika Admina ---
-        # Jeśli Admin -> domyślnie False (wyłączony), jeśli Użytkownik -> True (włączony)
         default_sound_state = False if self.is_admin else True
         self.sound_enabled = tk.BooleanVar(value=default_sound_state)
 
-
-        # -----------------------------------------------------
-
         # --- Sekcja przycisków Admina ---
         if self.is_admin:
-            # self.sound_chk = tk.Checkbutton(self.bottom_bar, text="Dźwięk", variable=self.sound_enabled)
-            # self.sound_chk.pack(side=tk.RIGHT, padx=5)
-
             self.admin_btn_frame = tk.Frame(self.bottom_bar)
             self.admin_btn_frame.pack(side=tk.LEFT, padx=2, pady=1)
 
@@ -157,9 +149,10 @@ class AlertClient:
                                          command=self.show_history_window)
             self.history_btn.pack(side=tk.LEFT, padx=1)
 
-            self.report_btn = tk.Button(self.admin_btn_frame, text="Wykaz", font=("Arial", 8, "bold"),
+            # ZMIANA: Przycisk nazywa się teraz "Raport" i otwiera menu wyboru
+            self.report_btn = tk.Button(self.admin_btn_frame, text="Raport", font=("Arial", 8, "bold"),
                                         bg="#d1ecf1", width=8, bd=1,
-                                        command=self.show_report_window)
+                                        command=self.open_report_selection_window)
             self.report_btn.pack(side=tk.LEFT, padx=1)
 
         self.idle_frame = tk.Frame(root, bg="#f0f0f0")
@@ -205,6 +198,169 @@ class AlertClient:
     def on_closing(self):
         if messagebox.askyesno("Zamykanie", "Czy na pewno chcesz zamknąć monitor połączeń?"):
             self.root.destroy()
+
+    # --- NOWA METODA: OKNO WYBORU RAPORTU ---
+    def open_report_selection_window(self):
+        sel_win = tk.Toplevel(self.root)
+        sel_win.title("Wybór Raportu")
+        sel_win.geometry("300x150")
+        sel_win.resizable(False, False)
+
+        # Centrowanie
+        sel_win.update_idletasks()
+        w = sel_win.winfo_width()
+        h = sel_win.winfo_height()
+        x = (sel_win.winfo_screenwidth() // 2) - (w // 2)
+        y = (sel_win.winfo_screenheight() // 2) - (h // 2)
+        sel_win.geometry(f'{w}x{h}+{x}+{y}')
+
+        tk.Label(sel_win, text="Wybierz typ raportu:", font=("Arial", 12)).pack(pady=10)
+
+        btn_daily = tk.Button(sel_win, text="Raport dzienny", bg="#007bff", fg="white", width=20,
+                              command=lambda: [sel_win.destroy(), self.show_report_window()])
+        btn_daily.pack(pady=5)
+
+        btn_stats = tk.Button(sel_win, text="Raport z wykresami (Porównanie)", bg="#17a2b8", fg="white", width=20,
+                              command=lambda: [sel_win.destroy(), self.show_stats_comparison_window()])
+        btn_stats.pack(pady=5)
+
+    # --- NOWA METODA: OKNO PORÓWNAWCZE (TABELA 2D) ---
+    def show_stats_comparison_window(self):
+        comp_win = tk.Toplevel(self.root)
+        comp_win.title("Analiza Trendów - Porównanie")
+        comp_win.geometry("1000x600")
+
+        # Pasek kontrolny
+        ctrl_frame = tk.Frame(comp_win, pady=10, padx=10, bg="#f8f9fa")
+        ctrl_frame.pack(fill=tk.X)
+
+        today = datetime.now()
+        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+
+        tk.Label(ctrl_frame, text="Od:", bg="#f8f9fa").pack(side=tk.LEFT, padx=5)
+        ent_from = tk.Entry(ctrl_frame, width=12)
+        ent_from.insert(0, start_date)
+        ent_from.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(ctrl_frame, text="Do:", bg="#f8f9fa").pack(side=tk.LEFT, padx=5)
+        ent_to = tk.Entry(ctrl_frame, width=12)
+        ent_to.insert(0, end_date)
+        ent_to.pack(side=tk.LEFT, padx=5)
+
+        # Kontener na tabelę
+        tree_frame = tk.Frame(comp_win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Inicjalizacja pustego Treeview
+        tree = ttk.Treeview(tree_frame)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        scroll_x = ttk.Scrollbar(comp_win, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=scroll_x.set)
+        scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        status_lbl = tk.Label(comp_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
+        status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def fetch_comparison():
+            d_from = ent_from.get().strip()
+            d_to = ent_to.get().strip()
+
+            if not d_from or not d_to:
+                messagebox.showwarning("Błąd", "Podaj zakres dat")
+                return
+
+            status_lbl.config(text="Pobieranie danych historycznych...", fg="blue")
+            comp_win.update()
+
+            try:
+                # Pobieramy dane z API (zakładamy, że /stats obsługuje filtrowanie po dacie)
+                params = {
+                    "date_from": d_from,
+                    "date_to": d_to,
+                    "token": Token
+                }
+                response = requests.get(f"{API_URL}/stats", params=params, timeout=10)
+
+                if response.status_code != 200:
+                    status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
+                    return
+
+                data_json = response.json()
+                records = data_json.get("data", [])
+
+                if not records:
+                    status_lbl.config(text="Brak danych w wybranym okresie.", fg="orange")
+                    return
+
+                # --- PRZETWARZANIE DANYCH DO FORMATU MACIERZY ---
+                # 1. Znajdź wszystkie unikalne daty (Kolumny)
+                # 2. Znajdź wszystkie unikalne klucze (Wiersze) - ignorując pola systemowe
+
+                unique_dates = set()
+                all_keys = set()
+
+                # Mapa: {klucz: {data: wartosc}}
+                matrix = defaultdict(dict)
+
+                for rec in records:
+                    r_date = rec.get("date")
+                    if not r_date: continue
+                    unique_dates.add(r_date)
+
+                    for k, v in rec.items():
+                        # Ignorujemy pola techniczne
+                        if k in ["_id", "id", "date", "received_at", "_created_at"]:
+                            continue
+                        # Dodajemy klucz do zbioru
+                        all_keys.add(k)
+                        # Zapisujemy wartość
+                        matrix[k][r_date] = v
+
+                # Sortowanie
+                sorted_dates = sorted(list(unique_dates))
+                sorted_keys = sorted(list(all_keys))
+
+                # --- BUDOWANIE TREEVIEW ---
+                # Czyścimy stare
+                tree.delete(*tree.get_children())
+
+                # Definicja kolumn: Pierwsza to "Źródło", potem daty
+                cols = ["source"] + sorted_dates
+                tree["columns"] = cols
+                tree["show"] = "headings"
+
+                # Nagłówki
+                tree.heading("source", text="Firma / Źródło", anchor=tk.W)
+                tree.column("source", width=250, minwidth=150, anchor=tk.W)
+
+                for d in sorted_dates:
+                    tree.heading(d, text=d, anchor=tk.CENTER)
+                    tree.column(d, width=90, minwidth=50, anchor=tk.CENTER)
+
+                # Wypełnianie danymi
+                for key in sorted_keys:
+                    row_values = [key]
+                    for d in sorted_dates:
+                        # Pobieramy wartość lub pusty string/0 jeśli brak danych w tym dniu
+                        val = matrix[key].get(d, "-")
+                        row_values.append(val)
+
+                    tree.insert("", tk.END, values=row_values)
+
+                status_lbl.config(text=f"Załadowano dane: {len(sorted_keys)} wierszy, {len(sorted_dates)} dni.",
+                                  fg="green")
+
+            except Exception as e:
+                status_lbl.config(text=f"Błąd przetwarzania: {e}", fg="red")
+
+        btn_fetch = tk.Button(ctrl_frame, text="Pobierz i Porównaj", bg="#28a745", fg="white", command=fetch_comparison)
+        btn_fetch.pack(side=tk.LEFT, padx=15)
 
     def show_report_window(self):
         rep_win = tk.Toplevel(self.root)
@@ -447,7 +603,6 @@ class AlertClient:
                 status_lbl.config(text="Sprawdzanie duplikatów...", fg="blue")
                 rep_win.update()
 
-                # Używamy istniejącego endpointu GET /stats do sprawdzenia
                 check_params = {
                     "date_from": date_val,
                     "date_to": date_val,
@@ -461,7 +616,6 @@ class AlertClient:
                     count = existing_data.get("count", 0)
 
                     if count > 0:
-                        # Pytamy użytkownika o decyzję
                         msg = (f"W bazie danych znaleziono już wpisy ({count}) dla daty {date_val}.\n\n"
                                "Czy chcesz dodać kolejny raport dla tej daty?")
                         if not messagebox.askyesno("Duplikat daty", msg):
@@ -469,29 +623,25 @@ class AlertClient:
                             return
                 else:
                     print(f"Błąd sprawdzania duplikatów: {check_response.status_code}")
-                    # Opcjonalnie: można tu przerwać, ale pozwalamy iść dalej w razie błędu sieci przy odczycie
 
             except Exception as e:
                 print(f"Błąd połączenia przy sprawdzaniu: {e}")
 
-            # 2. BUDOWANIE PAYLOADU (SUMOWANIE GRUP)
+            # 2. BUDOWANIE PAYLOADU
             payload = {
                 "date": date_val
             }
 
             for company, groups in current_report_data.items():
                 for group_name, details in groups.items():
-
-                    # Sumujemy 'total' ze wszystkich szczegółów w danej grupie
                     group_total = 0
                     for stats in details.values():
                         group_total += stats['total']
 
-                    # Klucz ogólny: "Firma - Grupa"
                     key = f"{company.capitalize()} - {group_name}"
                     payload[key] = group_total
 
-            # 3. WYSŁANIE DANYCH (POST)
+            # 3. WYSŁANIE DANYCH
             try:
                 status_lbl.config(text="Wysyłanie do bazy...", fg="blue")
                 rep_win.update()
@@ -613,14 +763,12 @@ class AlertClient:
         btn_save = tk.Button(top_frame, text="Zapisz CSV", bg="#28a745", fg="white", command=save_to_csv)
         btn_save.pack(side=tk.LEFT, padx=10)
 
-        # NOWY PRZYCISK ZAPISU DO BAZY
         btn_db = tk.Button(top_frame, text="Zapisz do Bazy", bg="#17a2b8", fg="white", command=save_to_db)
         btn_db.pack(side=tk.LEFT, padx=10)
 
         cb_expand = tk.Checkbutton(top_frame, text="Rozwijaj szczegóły",
                                    variable=var_expand_groups, bg="#f8f9fa", command=render_tree)
         cb_expand.pack(side=tk.LEFT, padx=20)
-
 
     def show_history_window(self):
         hist_win = tk.Toplevel(self.root)
@@ -651,15 +799,18 @@ class AlertClient:
                 tree.delete(item)
             sort_key = current_sort_col
             if sort_key == "timediff": sort_key = "date"
-            try: self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
-            except: pass
+            try:
+                self.history_data_cache.sort(key=lambda x: x[sort_key], reverse=current_sort_reverse)
+            except:
+                pass
             for row in self.history_data_cache:
                 tree.insert("", tk.END, values=(row['phone'], row['date'], row['timediff'], row['menu']),
                             tags=row['tags'])
 
         def on_header_click(col):
             nonlocal current_sort_col, current_sort_reverse
-            if current_sort_col == col: current_sort_reverse = not current_sort_reverse
+            if current_sort_col == col:
+                current_sort_reverse = not current_sort_reverse
             else:
                 current_sort_col = col
                 current_sort_reverse = True if col in ["date", "timediff"] else False
@@ -696,6 +847,7 @@ class AlertClient:
                 if item_id:
                     vals = tree.item(item_id, "values")
                     if vals: self.copy_number(vals[0])
+
         tree.bind("<Button-1>", on_tree_click)
 
         btn_frame = tk.Frame(hist_win)
@@ -722,9 +874,12 @@ class AlertClient:
                             if not showing_all and diff_hours > 48: continue
                             fmt_timediff = str(diff).split(".")[0]
                             row_tag = "normal"
-                            if diff_minutes < 15: row_tag = "green"
-                            elif diff_minutes < 30: row_tag = "orange"
-                            elif diff_minutes < 60: row_tag = "red"
+                            if diff_minutes < 15:
+                                row_tag = "green"
+                            elif diff_minutes < 30:
+                                row_tag = "orange"
+                            elif diff_minutes < 60:
+                                row_tag = "red"
                             new_cache.append({
                                 'phone': fmt_phone, 'date': raw_date,
                                 'timediff': fmt_timediff, 'menu': log.get("last_menu_full", "-"),
@@ -752,7 +907,8 @@ class AlertClient:
 
         btn_toggle = tk.Button(btn_frame, text="Pokaż wszystko", command=toggle_view, bg="#e1e1e1", width=20)
         btn_toggle.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Zamknij", command=hist_win.destroy, bg="#ffdddd", width=15).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="Zamknij", command=hist_win.destroy, bg="#ffdddd", width=15).pack(side=tk.RIGHT,
+                                                                                                    padx=5)
         fetch_data()
 
     def show_help_window(self):
@@ -943,8 +1099,10 @@ class AlertClient:
                 menu = menu.lstrip('- ').strip()
 
         status_color = "#007bff"
-        if status in ["ANSWERED", "Odebrane"]: status_color = "#28a745"
-        elif status in ["BUSY", "Zajęte", "Rozłączono"]: status_color = "#dc3545"
+        if status in ["ANSWERED", "Odebrane"]:
+            status_color = "#28a745"
+        elif status in ["BUSY", "Zajęte", "Rozłączono"]:
+            status_color = "#dc3545"
 
         tk.Frame(frame, bg=status_color, height=5).pack(fill=tk.X)
         content = tk.Frame(frame, bg="white", padx=10, pady=5)
@@ -965,8 +1123,12 @@ class AlertClient:
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
+
+
     def start_main_app(username, is_admin, assigned_ag):
         root.deiconify()
         app = AlertClient(root, username, is_admin, assigned_ag)
+
+
     LoginWindow(root, start_main_app)
     root.mainloop()
