@@ -224,11 +224,16 @@ class AlertClient:
                               command=lambda: [sel_win.destroy(), self.show_stats_comparison_window()])
         btn_stats.pack(pady=5)
 
-    # --- NOWA METODA: OKNO PORÓWNAWCZE (TABELA 2D) ---
+    # --- ZMODYFIKOWANA METODA: OKNO PORÓWNAWCZE Z ZAPISEM CSV ---
     def show_stats_comparison_window(self):
         comp_win = tk.Toplevel(self.root)
         comp_win.title("Analiza Trendów - Porównanie")
-        comp_win.geometry("1000x600")
+        comp_win.geometry("1100x700")
+
+        # Zmienne do przechowywania danych dla eksportu CSV
+        current_matrix = None
+        current_dates = []
+        current_keys = []
 
         # Pasek kontrolny
         ctrl_frame = tk.Frame(comp_win, pady=10, padx=10, bg="#f8f9fa")
@@ -248,26 +253,47 @@ class AlertClient:
         ent_to.insert(0, end_date)
         ent_to.pack(side=tk.LEFT, padx=5)
 
-        # Kontener na tabelę
-        tree_frame = tk.Frame(comp_win)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Kontener na przewijaną tabelę (Canvas + Scrollbary)
+        table_container = tk.Frame(comp_win, bg="white", bd=1, relief=tk.SUNKEN)
+        table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Inicjalizacja pustego Treeview
-        tree = ttk.Treeview(tree_frame)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(table_container, bg="white")
+        scroll_y = tk.Scrollbar(table_container, orient="vertical", command=canvas.yview)
+        scroll_x = tk.Scrollbar(table_container, orient="horizontal", command=canvas.xview)
 
-        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scroll_y.set)
+        # Ramka wewnątrz canvasa
+        scrollable_frame = tk.Frame(canvas, bg="white")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-
-        scroll_x = ttk.Scrollbar(comp_win, orient="horizontal", command=tree.xview)
-        tree.configure(xscrollcommand=scroll_x.set)
         scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _on_mousewheel_table(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel_table)
+
+        def _on_close_comp():
+            canvas.unbind_all("<MouseWheel>")
+            comp_win.destroy()
+
+        comp_win.protocol("WM_DELETE_WINDOW", _on_close_comp)
 
         status_lbl = tk.Label(comp_win, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
         status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # --- FUNKCJA POBIERANIA DANYCH ---
         def fetch_comparison():
+            nonlocal current_matrix, current_dates, current_keys
+
             d_from = ent_from.get().strip()
             d_to = ent_to.get().strip()
 
@@ -278,8 +304,10 @@ class AlertClient:
             status_lbl.config(text="Pobieranie danych historycznych...", fg="blue")
             comp_win.update()
 
+            for widget in scrollable_frame.winfo_children():
+                widget.destroy()
+
             try:
-                # Pobieramy dane z API (zakładamy, że /stats obsługuje filtrowanie po dacie)
                 params = {
                     "date_from": d_from,
                     "date_to": d_to,
@@ -296,16 +324,12 @@ class AlertClient:
 
                 if not records:
                     status_lbl.config(text="Brak danych w wybranym okresie.", fg="orange")
+                    current_matrix = None  # Reset danych przy braku wyników
                     return
 
-                # --- PRZETWARZANIE DANYCH DO FORMATU MACIERZY ---
-                # 1. Znajdź wszystkie unikalne daty (Kolumny)
-                # 2. Znajdź wszystkie unikalne klucze (Wiersze) - ignorując pola systemowe
-
+                # Przetwarzanie danych
                 unique_dates = set()
                 all_keys = set()
-
-                # Mapa: {klucz: {data: wartosc}}
                 matrix = defaultdict(dict)
 
                 for rec in records:
@@ -314,53 +338,121 @@ class AlertClient:
                     unique_dates.add(r_date)
 
                     for k, v in rec.items():
-                        # Ignorujemy pola techniczne
                         if k in ["_id", "id", "date", "received_at", "_created_at"]:
                             continue
-                        # Dodajemy klucz do zbioru
                         all_keys.add(k)
-                        # Zapisujemy wartość
                         matrix[k][r_date] = v
 
-                # Sortowanie
                 sorted_dates = sorted(list(unique_dates))
                 sorted_keys = sorted(list(all_keys))
 
-                # --- BUDOWANIE TREEVIEW ---
-                # Czyścimy stare
-                tree.delete(*tree.get_children())
+                # Zapisujemy do zmiennych dostępnych dla save_csv
+                current_matrix = matrix
+                current_dates = sorted_dates
+                current_keys = sorted_keys
 
-                # Definicja kolumn: Pierwsza to "Źródło", potem daty
-                cols = ["source"] + sorted_dates
-                tree["columns"] = cols
-                tree["show"] = "headings"
+                # --- RYSOWANIE TABELI ---
+                # Nagłówek
+                tk.Label(scrollable_frame, text="Firma / Źródło", font=("Arial", 9, "bold"),
+                         bg="#e9ecef", borderwidth=1, relief="solid", width=35, anchor="w", padx=5, pady=5).grid(
+                    row=0, column=0, sticky="nsew")
 
-                # Nagłówki
-                tree.heading("source", text="Firma / Źródło", anchor=tk.W)
-                tree.column("source", width=250, minwidth=150, anchor=tk.W)
+                for i, d in enumerate(sorted_dates):
+                    tk.Label(scrollable_frame, text=d, font=("Arial", 9, "bold"),
+                             bg="#e9ecef", borderwidth=1, relief="solid", width=12, padx=5, pady=5).grid(row=0,
+                                                                                                         column=i + 1,
+                                                                                                         sticky="nsew")
 
-                for d in sorted_dates:
-                    tree.heading(d, text=d, anchor=tk.CENTER)
-                    tree.column(d, width=90, minwidth=50, anchor=tk.CENTER)
+                # Wiersze z danymi
+                for r_idx, key in enumerate(sorted_keys):
+                    row_num = r_idx + 1
 
-                # Wypełnianie danymi
-                for key in sorted_keys:
-                    row_values = [key]
-                    for d in sorted_dates:
-                        # Pobieramy wartość lub pusty string/0 jeśli brak danych w tym dniu
-                        val = matrix[key].get(d, "-")
-                        row_values.append(val)
+                    tk.Label(scrollable_frame, text=key, font=("Arial", 9),
+                             bg="white", borderwidth=1, relief="solid", anchor="w", padx=5).grid(row=row_num,
+                                                                                                 column=0,
+                                                                                                 sticky="nsew")
 
-                    tree.insert("", tk.END, values=row_values)
+                    prev_val = None
+
+                    for c_idx, d in enumerate(sorted_dates):
+                        val_raw = matrix[key].get(d, 0)
+                        try:
+                            val = int(val_raw)
+                        except:
+                            val = 0
+
+                        fg_color = "black"
+                        val_text = str(val)
+
+                        if prev_val is not None:
+                            if val > prev_val:
+                                fg_color = "#28a745"
+                                val_text += " ▲"
+                            elif val < prev_val:
+                                fg_color = "#dc3545"
+                                val_text += " ▼"
+
+                        lbl = tk.Label(scrollable_frame, text=val_text, font=("Arial", 9), fg=fg_color,
+                                       bg="white", borderwidth=1, relief="solid")
+                        lbl.grid(row=row_num, column=c_idx + 1, sticky="nsew")
+
+                        prev_val = val
 
                 status_lbl.config(text=f"Załadowano dane: {len(sorted_keys)} wierszy, {len(sorted_dates)} dni.",
                                   fg="green")
 
             except Exception as e:
                 status_lbl.config(text=f"Błąd przetwarzania: {e}", fg="red")
+                print(e)
 
-        btn_fetch = tk.Button(ctrl_frame, text="Pobierz i Porównaj", bg="#28a745", fg="white", command=fetch_comparison)
+        # --- FUNKCJA ZAPISU CSV ---
+        def save_comparison_csv():
+            if not current_matrix or not current_dates:
+                messagebox.showwarning("Brak danych", "Najpierw pobierz dane, aby je zapisać.")
+                return
+
+            d_from = ent_from.get().strip()
+            d_to = ent_to.get().strip()
+            filename = f"Analiza_{d_from}_do_{d_to}"
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile=filename,
+                filetypes=[("Plik CSV", "*.csv")]
+            )
+            if not path: return
+
+            try:
+                with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f, delimiter=';')
+
+                    # Nagłówek: Źródło, Data1, Data2...
+                    header = ["Firma / Źródło"] + current_dates
+                    writer.writerow(header)
+
+                    # Dane
+                    for key in current_keys:
+                        row = [key]
+                        for d in current_dates:
+                            # Pobieramy czystą wartość (bez strzałek)
+                            val = current_matrix[key].get(d, 0)
+                            row.append(val)
+                        writer.writerow(row)
+
+                status_lbl.config(text=f"Zapisano plik: {path}", fg="green")
+                messagebox.showinfo("Sukces", "Plik CSV został zapisany pomyślnie.")
+            except Exception as e:
+                messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać pliku:\n{e}")
+
+        # Przyciski
+        btn_fetch = tk.Button(ctrl_frame, text="Pobierz i Porównaj", bg="#28a745", fg="white",
+                              command=fetch_comparison)
         btn_fetch.pack(side=tk.LEFT, padx=15)
+
+        # Nowy przycisk zapisu
+        btn_csv = tk.Button(ctrl_frame, text="Zapisz do CSV", bg="#17a2b8", fg="white",
+                            command=save_comparison_csv)
+        btn_csv.pack(side=tk.LEFT, padx=5)
 
     def show_report_window(self):
         rep_win = tk.Toplevel(self.root)
@@ -660,13 +752,13 @@ class AlertClient:
                 status_lbl.config(text="Błąd połączenia", fg="red")
                 messagebox.showerror("Błąd", f"Nie udało się wysłać danych: {e}")
 
-        # --- LOGIKA POBIERANIA DANYCH ---
+        # --- POPRAWIONA FUNKCJA FETCH REPORT ---
         def fetch_report():
             nonlocal current_report_data
             date_val = entry_date.get().strip()
             if not date_val: return
 
-            status_lbl.config(text="Pobieranie...", fg="blue")
+            status_lbl.config(text="Pobieranie danych i konfiguracji...", fg="blue")
             rep_win.update()
 
             NAME_CORRECTIONS = {
@@ -678,7 +770,59 @@ class AlertClient:
                 "lider beton strona": "lider beton"
             }
 
+            # Funkcja pomocnicza do czyszczenia numerów
+            def normalize_num(n):
+                if not n: return ""
+                # Usuń wszystko co nie jest cyfrą, usuń +48 z początku
+                s = str(n).strip().replace(" ", "").replace("-", "").replace("+", "")
+                if s.startswith("48") and len(s) > 9:
+                    s = s[2:]
+                return s
+
             try:
+                # 1. POBRANIE KONFIGURACJI NUMERÓW (STATS-DATA)
+                phone_map = {}  # { "123456789": {"company": "...", "group": "..."} }
+
+                try:
+                    stats_resp = requests.get(f"{API_URL}/stats-data", params={"token": Token}, timeout=5)
+                    if stats_resp.status_code == 200:
+                        json_resp = stats_resp.json()
+                        stats_docs = json_resp.get("data", [])
+
+                        # Iterujemy po liście dokumentów (zwykle jest tam jeden główny obiekt)
+                        for doc in stats_docs:
+                            # Iterujemy po kluczach dokumentu (Nazwy firm: "beton polska", "lider beton" itp.)
+                            for key, val in doc.items():
+                                if key in ["_id", "id"]: continue  # Pomiń pola systemowe
+
+                                company_key = key.lower().strip()
+
+                                # Sprawdzamy czy wartość to słownik grup (np. { "wizytówki": [...], "olx": [...] })
+                                if isinstance(val, dict):
+                                    for group_key, numbers_list in val.items():
+                                        group_name = group_key.strip()
+
+                                        # Obsługa listy numerów
+                                        if isinstance(numbers_list, list):
+                                            for raw_num in numbers_list:
+                                                clean = normalize_num(raw_num)
+                                                if clean:
+                                                    phone_map[clean] = {"company": company_key,
+                                                                        "group": group_name}
+
+                                        # Obsługa pojedynczego numeru (zabezpieczenie)
+                                        elif isinstance(numbers_list, str):
+                                            clean = normalize_num(numbers_list)
+                                            if clean:
+                                                phone_map[clean] = {"company": company_key, "group": group_name}
+
+                        print(f"DEBUG: Załadowano {len(phone_map)} numerów do mapowania.")
+                    else:
+                        print(f"Błąd stats-data: {stats_resp.status_code}")
+                except Exception as e:
+                    print(f"Wyjątek przy stats-data: {e}")
+
+                # 2. POBRANIE POŁĄCZEŃ Z TELESTRADY
                 url = f"{API_URL}/telestrada/connections"
                 response = requests.get(url, params={"date": date_val, "token": Token}, timeout=10)
 
@@ -688,49 +832,78 @@ class AlertClient:
                     if isinstance(data, list):
                         connections = data
                     elif isinstance(data, dict):
-                        connections = data.get("connections") or next((v for v in data.values() if isinstance(v, list)),
-                                                                      [])
+                        connections = data.get("connections") or next(
+                            (v for v in data.values() if isinstance(v, list)), [])
 
                     if not connections:
-                        status_lbl.config(text="Brak danych.", fg="orange")
+                        status_lbl.config(text="Brak danych połączeń.", fg="orange")
                         current_report_data = None
                         render_tree()
                         return
 
-                    stats = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {"total": 0, "cancelled": 0})))
+                    stats = defaultdict(
+                        lambda: defaultdict(lambda: defaultdict(lambda: {"total": 0, "cancelled": 0})))
                     count_total = 0
+                    mapped_count = 0
 
                     for conn in connections:
                         if not isinstance(conn, dict): continue
+
+                        # Pobieramy dane
                         menu_full = conn.get("element_menu_name") or conn.get("menu_name") or ""
-                        if not menu_full: continue
+                        ivr_raw = conn.get("ivr_phone_number", "")
 
-                        count_total += 1
-                        menu_full = menu_full.strip()
+                        # Normalizacja numeru z połączenia
+                        ivr_clean = normalize_num(ivr_raw)
 
-                        if "lider beton" in menu_full.lower() and " - " not in menu_full:
-                            menu_full = re.sub(r'(?i)^(lider\s?beton)(\s+)', r'\1 - ', menu_full)
+                        company_name = "nieznane"
+                        group_name = "inne"
+                        raw_type_name = "brak"
 
-                        if " - " in menu_full:
-                            parts = menu_full.split(" - ", 1)
-                            company_name = parts[0].strip().lower()
-                            raw_type_name = parts[1].strip()
-                        else:
-                            check = menu_full.replace(" ", "")
-                            if len(check) >= 9 and check[-9:].isdigit():
-                                company_name = menu_full[:-9].strip().lower()
+                        matched_in_db = False
+
+                        # KROK A: SPRAWDZENIE W MAPIE NUMERÓW (PRIORYTET)
+                        if ivr_clean and ivr_clean in phone_map:
+                            mapping = phone_map[ivr_clean]
+                            company_name = mapping["company"]
+                            group_name = mapping["group"]
+                            raw_type_name = ivr_clean  # Jako nazwę szczegółową dajemy numer
+                            matched_in_db = True
+                            mapped_count += 1
+
+                        # KROK B: PARSOWANIE MENU (JEŚLI NIE ZNALEZIONO W BAZIE)
+                        if not matched_in_db:
+                            if not menu_full: continue  # Pomiń, jeśli nie ma ani numeru w bazie, ani nazwy menu
+
+                            menu_full = menu_full.strip()
+
+                            if "lider beton" in menu_full.lower() and " - " not in menu_full:
+                                menu_full = re.sub(r'(?i)^(lider\s?beton)(\s+)', r'\1 - ', menu_full)
+
+                            if " - " in menu_full:
+                                parts = menu_full.split(" - ", 1)
+                                company_name = parts[0].strip().lower()
+                                raw_type_name = parts[1].strip()
                             else:
-                                company_name = menu_full.strip().lower()
-                            raw_type_name = f"{menu_full.replace(company_name, '').strip()}" or "Inne"
+                                check = menu_full.replace(" ", "")
+                                if len(check) >= 9 and check[-9:].isdigit():
+                                    company_name = menu_full[:-9].strip().lower()
+                                else:
+                                    company_name = menu_full.strip().lower()
+                                raw_type_name = f"{menu_full.replace(company_name, '').strip()}" or "Inne"
 
-                        if company_name in NAME_CORRECTIONS: company_name = NAME_CORRECTIONS[company_name]
+                            if company_name in NAME_CORRECTIONS: company_name = NAME_CORRECTIONS[company_name]
 
-                        group_name = re.sub(r'[\s]*\d[\d\s-]{5,}\d$', '', raw_type_name).strip().strip("- ").strip()
-                        if group_name.lower() in ["wizytówki w kampanii",
-                                                  "wizytówki kampania"]: group_name = "wizytówki kampania"
-                        if not group_name: group_name = "Inne / Bezpośrednie"
+                            group_name = re.sub(r'[\s]*\d[\d\s-]{5,}\d$', '', raw_type_name).strip().strip(
+                                "- ").strip()
+                            if group_name.lower() in ["wizytówki w kampanii",
+                                                      "wizytówki kampania"]: group_name = "wizytówki kampania"
+                            if not group_name: group_name = "Inne / Bezpośrednie"
 
-                        # --- ZLICZANIE ---
+                        # ZLICZANIE
+                        count_total += 1
+
+                        # Zapis do struktury
                         entry = stats[company_name][group_name][raw_type_name]
                         entry['total'] += 1
 
@@ -750,11 +923,14 @@ class AlertClient:
                     self.sort_col = "#0"
                     self.sort_reverse = False
                     render_tree()
-                    status_lbl.config(text=f"Sukces: {count_total} połączeń.", fg="green")
+                    status_lbl.config(text=f"Sukces: {count_total} poł. (zmapowano po IVR: {mapped_count})",
+                                      fg="green")
                 else:
                     status_lbl.config(text=f"Błąd API: {response.status_code}", fg="red")
             except Exception as e:
                 status_lbl.config(text=f"Błąd: {str(e)}", fg="red")
+                import traceback
+                traceback.print_exc()
 
         # Przyciski
         btn_fetch = tk.Button(top_frame, text="Pobierz dane", bg="#007bff", fg="white", command=fetch_report)
@@ -922,7 +1098,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.63 [09.02]"
+                "Wersja 0.64 [10.02]"
                 )
 
         if not self.is_admin:
