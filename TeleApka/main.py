@@ -124,6 +124,9 @@ class AlertClient:
         self.last_data_snapshot = None
         self.is_sound_playing = False
 
+        # --- NOWE: Zmienna do śledzenia czasu dla logiki opóźnienia dźwięku ---
+        self.moh_start_time = None
+
         # --- GUI ---
         self.bottom_bar = tk.Frame(root, bd=1, relief=tk.SUNKEN)
         self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1098,7 +1101,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.64 [10.02]"
+                "Wersja 0.65 [11.02]"
                 )
 
         if not self.is_admin:
@@ -1167,41 +1170,58 @@ class AlertClient:
         current_ids = {alert['id'] for alert in self.active_alerts}
         new_alerts = current_ids - self.seen_alert_ids
 
-        # 1. Obsługa wyciągania okna na wierzch (tylko przy nowych połączeniach)
         if new_alerts:
             self.force_window_to_front()
 
-        # 2. LOGIKA DŹWIĘKU (Stanowa: Czy KTOKOLWIEK dzwoni?)
-        # Sprawdzamy, czy na liście jest chociaż jedno połączenie ze statusem CALLING
-        any_calling = False
+        # --- LOGIKA DŹWIĘKU (ZMODYFIKOWANA) ---
+
+        # 1. Sprawdzamy, czy jest jakiś alert, który spełnia warunki:
+        #    - status to MOH
+        #    - agent_name NIE jest puste
+        #    (Jeśli agent_name jest puste, to znaczy że w kolejce -> brak dźwięku)
+
+        moh_with_agent_condition = False
+
         for alert in self.active_alerts:
             status = alert.get("status")
-            # Zakładamy, że status to "CALLING". Czasem API zwraca puste lub None dla dzwoniących,
-            # więc warto obsłużyć też ten przypadek, jeśli jest taki w Twoim systemie.
-            if status == "MOH":
-                any_calling = True
+            agent_name = alert.get("agent_name")
+
+            # Sprawdzamy czy agent_name jest "truthy" (nie None i nie pusty string)
+            if status == "MOH" and agent_name:
+                moh_with_agent_condition = True
                 break
 
+        should_play_sound = False
+
+        if moh_with_agent_condition:
+            if self.moh_start_time is None:
+                # Warunek dopiero wystąpił, startujemy licznik
+                self.moh_start_time = time.time()
+            else:
+                # Warunek trwa, sprawdzamy ile czasu minęło
+                elapsed = time.time() - self.moh_start_time
+                if elapsed >= 3:
+                    should_play_sound = True
+        else:
+            # Warunek zniknął (rozłączono lub status inny), reset licznika
+            self.moh_start_time = None
+            should_play_sound = False
+
+        # Obsługa samego odtwarzania
         if self.sound_enabled.get() and winsound:
-            # SYTUACJA A: Ktoś dzwoni, a my jeszcze nie gramy dźwięku -> START PĘTLI
-            if any_calling and not self.is_sound_playing:
+            if should_play_sound and not self.is_sound_playing:
                 sound_file = "sound.wav"
                 try:
                     if os.path.exists(sound_file):
-                        # SND_LOOP - pętla, SND_ASYNC - nie blokuj programu
                         winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
                     else:
-                        # Fallback systemowy (SystemHand zazwyczaj nie pętli się dobrze z aliasem, ale to awaryjne)
                         winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_LOOP)
-
                     self.is_sound_playing = True
                 except Exception as e:
                     print(f"Błąd startu dźwięku: {e}")
 
-            # SYTUACJA B: Nikt nie dzwoni (wszyscy ANSWERED lub pusta lista), a dźwięk gra -> STOP
-            elif not any_calling and self.is_sound_playing:
+            elif not should_play_sound and self.is_sound_playing:
                 try:
-                    # Zatrzymanie dźwięku
                     winsound.PlaySound(None, winsound.SND_PURGE)
                     self.is_sound_playing = False
                 except Exception as e:
