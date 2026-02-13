@@ -144,6 +144,7 @@ class HistoryResponse(BaseModel):
     count: int
     logs: List[LogEntrySchema]
 
+
 # --- ENDPOINTY ---
 
 @app.get("/")
@@ -163,7 +164,7 @@ async def login(data: LoginSchema):
     if not user:
         raise HTTPException(status_code=404, detail="Taki użytkownik nie istnieje.")
 
-    # ZMIANA 2: Normalizacja assigned_ag, aby zawsze zwracać listę (nawet dla starych rekordów)
+    # ZMIANA: Normalizacja assigned_ag
     raw_assigned = user.get("assigned_ag")
     assigned_list = []
 
@@ -171,14 +172,13 @@ async def login(data: LoginSchema):
         if isinstance(raw_assigned, list):
             assigned_list = raw_assigned
         else:
-            # Jeśli w bazie jest stary format (string), zamień go na listę jednoelementową
             assigned_list = [str(raw_assigned)]
 
     return {
         "message": "Zalogowano",
         "username": user["username"],
         "is_admin": user.get("is_admin", False),
-        "assigned_ag": assigned_list  # Zwracamy zawsze listę
+        "assigned_ag": assigned_list
     }
 
 
@@ -195,12 +195,14 @@ async def get_status():
         mapped_alerts.append({
             "id": str(doc["_id"]),
             "call_id": doc.get("call_id", "manual"),
+            "ivr": doc.get("ivr", "Nieznany"),
             "caller": doc.get("caller", "Nieznany"),
             "source": doc.get("source", "Nieznane"),
             "message": doc.get("message", ""),
             "menu_name": doc.get("menu_name"),
             "agent_name": doc.get("agent_name"),
             "status": doc.get("status"),
+            "answered": doc.get("answered", False),
             "timestamp": doc.get("last_updated", datetime.now())
         })
 
@@ -215,26 +217,16 @@ async def get_status():
 async def add_stats(payload: dict = Body(...)):
     """
     Zapisuje raport statystyczny.
-    Wymaga, aby w JSON-ie znajdowało się pole 'date' (format YYYY-MM-DD),
-    które posłuży do późniejszego filtrowania.
     """
     if collection_stats is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
 
-    # Sprawdź, czy klient przesłał datę, po której będziemy filtrować
-    # Jeśli w JSON wysyłasz klucz "data" (po polsku), zmień poniżej "date" na "data"
     if "date" not in payload:
         raise HTTPException(status_code=400, detail="Brak pola 'date' (YYYY-MM-DD) w przesłanym JSON.")
 
     try:
-        # Opcjonalnie: dodajemy timestamp wpłynięcia rekordu (techniczny)
         payload["_created_at"] = datetime.now()
-
-        # Zapis do bazy
-        # Jeśli chcesz nadpisywać statystyki dla danego dnia, użyj update_one z upsert=True
-        # Tutaj robimy insert_one (każdy wysłany raport to nowy dokument)
         result = await collection_stats.insert_one(payload)
-
         return {"status": "saved", "id": str(result.inserted_id)}
     except Exception as e:
         print(f"❌ Błąd zapisu statystyk: {e}")
@@ -247,11 +239,6 @@ async def get_stats(
         date_to: str = Query(..., description="Data końcowa (YYYY-MM-DD)", example="2026-02-28"),
         token: str = Query(..., description="Token administratora")
 ):
-    """
-    Pobiera statystyki z zakresu dat.
-    Filtruje po polu 'date' wewnątrz dokumentów JSON.
-    """
-    # 1. Autoryzacja
     if token != GLOBAL_ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
 
@@ -259,9 +246,6 @@ async def get_stats(
         raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
 
     try:
-        # 2. Budowanie zapytania do Mongo
-        # Szukamy w polu "date" (lub "data" jeśli tak nazwałeś w POST)
-        # Format YYYY-MM-DD pozwala na porównywanie stringów ($gte, $lte)
         query = {
             "date": {
                 "$gte": date_from,
@@ -269,15 +253,12 @@ async def get_stats(
             }
         }
 
-        # 3. Pobranie danych (sortowanie rosnąco po dacie)
         cursor = collection_stats.find(query).sort("date", 1)
         stats_docs = await cursor.to_list(length=None)
 
-        # 4. Mapowanie (usuwanie _id, konwersja na czysty JSON)
         mapped_stats = []
         for doc in stats_docs:
             doc["id"] = str(doc.pop("_id"))
-            # Usuwamy techniczny timestamp, jeśli nie jest potrzebny klientowi
             if "_created_at" in doc:
                 del doc["_created_at"]
             mapped_stats.append(doc)
@@ -294,28 +275,58 @@ async def get_stats(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats-data")
-async def get_stats_data_list(token: str = Query(..., description="Token administratora")):
+# --- NOWY ENDPOINT POST ---
+@app.post("/stats-data", status_code=201)
+async def add_stats_data(
+        payload: dict = Body(...),
+        token: str = Query(..., description="Token administratora")
+):
     """
-    Pobiera dane konfiguracyjne do statystyk (np. listy numerów, kategorie)
-    z kolekcji stats_data.
+    Zapisuje dane konfiguracyjne do statystyk.
+    Dodaje automatycznie pole created_at.
     """
-    # 1. Autoryzacja
     if token != GLOBAL_ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
 
-    # 2. Sprawdzenie połączenia z bazą
     if collection_stats_data is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych stats_data")
 
     try:
-        # 3. Pobranie wszystkich dokumentów
-        cursor = collection_stats_data.find({})
-        docs = await cursor.to_list(length=None)
+        # Dodajemy datę stworzenia
+        payload["created_at"] = datetime.now()
+
+        result = await collection_stats_data.insert_one(payload)
+
+        return {
+            "status": "saved",
+            "id": str(result.inserted_id),
+            "created_at": payload["created_at"]
+        }
+    except Exception as e:
+        print(f"❌ Błąd zapisu stats_data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- ZMODYFIKOWANY ENDPOINT GET ---
+@app.get("/stats-data")
+async def get_stats_data_list(token: str = Query(..., description="Token administratora")):
+    """
+    Pobiera dane konfiguracyjne do statystyk.
+    Zwraca tylko NAJNOWSZY wpis (sortowanie po created_at malejąco).
+    """
+    if token != GLOBAL_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
+
+    if collection_stats_data is None:
+        raise HTTPException(status_code=503, detail="Brak bazy danych stats_data")
+
+    try:
+        # Pobieramy tylko jeden, najnowszy rekord
+        cursor = collection_stats_data.find().sort("created_at", -1).limit(1)
+        docs = await cursor.to_list(length=1)
 
         mapped_data = []
         for doc in docs:
-            # Zamiana ObjectId na string, aby był poprawny JSON
             doc["id"] = str(doc.pop("_id"))
             mapped_data.append(doc)
 
@@ -334,7 +345,6 @@ async def get_telestrada_connections(
         date: str = Query(..., description="Data w formacie YYYY-MM-DD", example="2026-02-05"),
         token: str = Query(..., description="Token administratora")
 ):
-    # ZABEZPIECZENIE
     if token != GLOBAL_ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
 
@@ -343,7 +353,7 @@ async def get_telestrada_connections(
         api_key = os.getenv("TELESTRADA_API_KEY")
 
     if not api_key:
-        raise HTTPException(status_code=500, detail="Brak skonfigurowanego klucza API Telestrady (Telestrada.API_KEY).")
+        raise HTTPException(status_code=500, detail="Brak skonfigurowanego klucza API Telestrady.")
 
     url = "https://api.telestrada.pl/api/v1/callcontact/connections"
     headers = {
@@ -367,7 +377,6 @@ async def get_telestrada_connections(
 
 @app.get("/history", response_model=HistoryResponse)
 async def get_history(token: str = Query(..., description="Token administratora")):
-    # ZABEZPIECZENIE
     if token != GLOBAL_ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
 
@@ -397,7 +406,6 @@ async def create_user(user: UserCreate, token: str):
     if collection_users is None:
         raise HTTPException(status_code=503, detail="Brak połączenia z bazą użytkowników")
 
-    # Pydantic sam zwaliduje, że assigned_ag to lista stringów lub None
     user_data = user.dict()
 
     if token != GLOBAL_ACCESS_TOKEN:
@@ -428,11 +436,9 @@ async def add_sms(request: Request):
         sms_to = get_val("sms_to")
         sms_from = get_val("sms_from")
         sms_text = get_val("sms_text")
-        sms_date = get_val("sms_date")
-        username = get_val("username")
-        msg_id_raw = get_val("MsgId")
-
-        # Tu byłby kod zapisu do mongo (pominięty w skrócie, bo nie dotyczy pytania)
+        # sms_date = get_val("sms_date")
+        # username = get_val("username")
+        # msg_id_raw = get_val("MsgId")
 
         print("🔄 Próba dodania aktywności do Bitrix24...")
 
@@ -463,34 +469,40 @@ async def add_sms(request: Request):
 
 @app.get("/webhook/telestrada")
 async def telestrada_webhook(
+        ivr: str = Query(..., description="Identyfikator IVR (#ivr_id#)"),
         id: str = Query(..., description="Unikalne ID połączenia (#call_id#)"),
         numer: str = Query(..., description="Numer dzwoniącego (#num_a#)"),
         ag: Optional[str] = Query(None, description="Numer docelowy/agenta (#num_b#)"),
         czy_trwa: bool = Query(True, description="Status online: true/false (#online#)"),
         status: Optional[str] = Query(None, description="Status tekstowy (#status#)"),
+        answered: Optional[str] = Query(None, description="Status odpowiedzi (#answered#)"),
         menu: Optional[str] = Query(None, description="Nazwa menu (#menu_name#)"),
         agent_name: Optional[str] = Query(None, description="Nazwa agenta (#agent_name#)")
 ):
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
-    if menu and collection_logs is not None:
+    # --- ZMIANA: Logowanie numeru z IVR ---
+    if collection_logs is not None:
         try:
-            target_number = menu.strip()[-9:]
-            if len(target_number) == 9:
+            # Używamy bezpośrednio numeru IVR
+            target_number = ivr
+
+            # (Opcjonalnie) Możemy dodać walidację czy ivr nie jest puste
+            if target_number:
                 await collection_logs.update_one(
                     {"phone_number": target_number},
                     {
                         "$set": {
                             "last_call": datetime.now(),
-                            "last_menu_full": menu
+                            "last_menu_full": menu  # Zapisujemy nazwę menu informacyjnie, jeśli jest
                         },
                     },
                     upsert=True
                 )
-                print(f"💾 Zalogowano połączenie dla numeru z menu: {target_number}")
+                print(f"💾 Zalogowano połączenie dla numeru IVR: {target_number}")
         except Exception as e:
-            print(f"❌ Błąd podczas logowania numeru z menu: {e}")
+            print(f"❌ Błąd podczas logowania numeru IVR: {e}")
 
     if not czy_trwa:
         print(f"📞 Koniec połączenia {id} ({status}). Usuwam.")
@@ -512,12 +524,14 @@ async def telestrada_webhook(
 
     alert_data = {
         "call_id": id,
+        "ivr": ivr,
         "caller": caller_num,
         "source": source_num,
         "message": display_message,
         "menu_name": menu,
         "agent_name": agent_name,
         "status": status,
+        "answered": answered,
         "last_updated": datetime.now()
     }
 
