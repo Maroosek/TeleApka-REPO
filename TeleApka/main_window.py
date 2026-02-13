@@ -19,8 +19,10 @@ class AlertClient:
         self.username = username
         self.is_admin = is_admin
         self.assigned_ag = assigned_ag
+        self.ivr_mapping = {}  # Słownik: { "numer_bez_48": "Nazwa z API" }
+        self.last_ivr_update = 0
 
-        # Tytuł i ikona
+        # Tytuł i ikona (bez zmian...)
         ag_title_str = ", ".join(map(str, assigned_ag)) if isinstance(assigned_ag, list) else (
             str(assigned_ag) if assigned_ag else "Brak")
         role_info = "ADMIN" if self.is_admin else f"Stanowisko: {ag_title_str}"
@@ -38,8 +40,14 @@ class AlertClient:
 
         self.setup_ui()
 
+        # Uruchomienie pętli sieciowej
         self.thread = threading.Thread(target=self.network_loop, daemon=True)
         self.thread.start()
+
+        # --- NOWE: Wątek aktualizacji IVR co godzinę ---
+        self.ivr_thread = threading.Thread(target=self.update_ivr_map_loop, daemon=True)
+        self.ivr_thread.start()
+
         self.root.after(500, self.update_gui)
 
     def setup_ui(self):
@@ -80,6 +88,44 @@ class AlertClient:
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
         self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)),
                                                                                 "units") if self.canvas_frame.winfo_ismapped() else None)
+
+    def update_ivr_map_loop(self):
+        """Pobiera dane i buduje płaską mapę numerów dla szybkiego wyszukiwania."""
+        while True:
+            try:
+                params = {"token": config.TOKEN}
+                response = requests.get(f"{config.API_URL}/stats-data", params=params, timeout=5)
+
+                if response.status_code == 200:
+                    raw_data = response.json()
+                    # Jeśli API zwraca listę dokumentów (z MongoDB), bierzemy najnowszy
+                    if isinstance(raw_data, list) and len(raw_data) > 0:
+                        tree = raw_data[0]
+                    elif isinstance(raw_data, dict) and "data" in raw_data:
+                        tree = raw_data["data"][0] if raw_data["data"] else {}
+                    else:
+                        tree = raw_data
+
+                    new_map = {}
+                    # Przetwarzamy drzewko: Branza -> Zrodlo -> [Numery]
+                    for branza, zrodla in tree.items():
+                        if isinstance(zrodla, dict):
+                            for zrodlo, numery in zrodla.items():
+                                for nr in numery:
+                                    # WAŻNE: Klucz w self.ivr_mapping musi być identyczny
+                                    # z tym co wyjdzie z clean_ivr w create_alert_widget
+                                    clean_nr = utils.normalize_num(str(nr))
+                                    new_map[clean_nr] = f"{branza.upper()} - {zrodlo.capitalize()}"
+
+                    self.ivr_mapping = new_map
+                    print(f"Zaktualizowano mapę IVR: {len(new_map)} numerów.")
+                else:
+                    print(f"Błąd API /stats-data: {response.status_code}")
+
+            except Exception as e:
+                print(f"Błąd przetwarzania mapy IVR: {e}")
+
+            time.sleep(3600)  # Aktualizacja co godzinę
 
     def network_loop(self):
         while True:
@@ -153,12 +199,57 @@ class AlertClient:
 
         caller = utils.format_phone_number(alert.get('caller', 'Nieznany'))
         target = alert.get('agent_name') or alert.get('source', 'Infolinia')
-        menu = alert.get('menu_name')
+        menu_name = alert.get('menu_name', '') or ''
+
+        # --- ZAAWANSOWANA LOGIKA POSZUKIWANIA KLUCZA MAPY ---
+        candidates = []
+
+        # 1. KANDYDAT PIERWSZY: Pole 'ivr' z API
+        raw_ivr = alert.get('ivr') or alert.get('ivr_phone_number')
+        if raw_ivr:
+            candidates.append(utils.normalize_num(str(raw_ivr)))
+
+        # 2. KANDYDAT DRUGI: Numer wyciągnięty z 'menu_name' (np. z "Firma - Opis 123456789")
+        # Często Telestrada dokleja numer na końcu nazwy menu, gdy brakuje go w polu ivr
+        if menu_name:
+            # Usuwamy spacje i myślniki, szukamy ciągu 9 cyfr
+            # Regex: Znajdź 9 cyfr, które nie mają cyfry przed sobą ani za sobą
+            found = re.search(r'(?<!\d)(\d{9})(?!\d)', menu_name.replace(" ", "").replace("-", ""))
+            if found:
+                candidates.append(found.group(1))
+
+        # 3. KANDYDAT TRZECI: Pole 'source' (jako ostateczność, często to numer techniczny 22...)
+        raw_source = alert.get('source')
+        if raw_source:
+            candidates.append(utils.normalize_num(str(raw_source)))
+
+        # --- WERYFIKACJA KANDYDATÓW W MAPIE ---
+        display_menu = menu_name  # Domyślnie wyświetlamy to co przyszło z API
+        matched_key = None
+
+        for num in candidates:
+            if num and num in self.ivr_mapping:
+                display_menu = self.ivr_mapping[num]
+                matched_key = num
+                break  # Znaleźliśmy pasujący numer, przerywamy pętlę!
+
+        # Logowanie dla debugowania (opcjonalne)
+        if matched_key:
+            print(f"✅ DOPASOWANO: {matched_key} -> {display_menu}")
+        elif candidates:
+            # Pokaż po jakich numerach próbowaliśmy szukać
+            print(f"❌ BRAK W MAPIE. Kandydaci: {candidates} (Oryginał: {menu_name})")
+        # ----------------------------------------------------
+
         status = alert.get('status')
 
+        # Cenzura i formatowanie dla stanowisk (nie-admin)
         if not self.is_admin:
             target = re.sub(r'\d+', '', str(target)).lstrip('- ').strip()
-            if menu: menu = re.sub(r'\d+', '', str(menu)).lstrip('- ').strip()
+            # Jeśli wyświetlamy oryginalne menu_name, wycinamy numery.
+            # Jeśli wyświetlamy naszą ładną nazwę z mapy (matched_key istnieje), zostawiamy ją w spokoju.
+            if not matched_key and display_menu:
+                display_menu = re.sub(r'\d+', '', str(display_menu)).lstrip('- ').strip()
 
         col = "#28a745" if status in ["ANSWERED", "Odebrane"] else (
             "#dc3545" if status in ["BUSY", "Zajęte"] else "#007bff")
@@ -173,8 +264,10 @@ class AlertClient:
         lbl.pack(side=tk.LEFT)
         lbl.bind("<Button-1>", lambda e: self.copy_num(caller))
         tk.Label(h_frame, text=f" ➔ {target}", font=("Arial", 14, "bold"), bg="white", fg="#555").pack(side=tk.LEFT)
-        if menu: tk.Label(c_frame, text=f"📂 {menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(
-            anchor="w")
+
+        if display_menu:
+            tk.Label(c_frame, text=f"📂 {display_menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(
+                anchor="w")
 
     def copy_num(self, n):
         self.root.clipboard_clear();

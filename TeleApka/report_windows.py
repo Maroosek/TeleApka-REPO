@@ -559,3 +559,112 @@ def show_report_selection(parent):
               command=lambda: [sel_win.destroy(), DailyReportWindow(parent)]).pack(pady=5)
     tk.Button(sel_win, text="Raport z wykresami", bg="#17a2b8", fg="white", width=20,
               command=lambda: [sel_win.destroy(), StatsComparisonWindow(parent)]).pack(pady=5)
+    tk.Label(sel_win, text="Wybierz typ konfiguracji", font=("Arial", 12)).pack(pady=10)
+    tk.Button(sel_win, text="Numery", bg="#007bff", fg="white", width=20,
+              command=lambda: [sel_win.destroy(), NumbersConfigWindow(parent)]).pack(pady=5)
+    tk.Button(sel_win, text="Okres kampanii", bg="#17a2b8", fg="white", width=20,
+              command=lambda: [sel_win.destroy(), StatsComparisonWindow(parent)]).pack(pady=5)
+
+    class NumbersConfigWindow(tk.Toplevel):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.title("Konfiguracja Numerów - Import CSV")
+            self.geometry("500x300")
+            self.selected_path = tk.StringVar(value="Nie wybrano pliku")
+
+            self.setup_ui()
+
+        def setup_ui(self):
+            main_frame = tk.Frame(self, padx=20, pady=20)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+
+            tk.Label(main_frame, text="Import mapowania numerów z pliku CSV", font=("Arial", 12, "bold")).pack(pady=10)
+
+            # Sekcja wyboru pliku
+            file_frame = tk.LabelFrame(main_frame, text="Plik źródłowy", padx=10, pady=10)
+            file_frame.pack(fill=tk.X, pady=10)
+
+            tk.Label(file_frame, textvariable=self.selected_path, wraplength=400, fg="gray").pack(side=tk.LEFT,
+                                                                                                  fill=tk.X,
+                                                                                                  expand=True)
+            tk.Button(file_frame, text="Wybierz plik", command=self.browse_file).pack(side=tk.RIGHT, padx=5)
+
+            # Przycisk wysyłania
+            self.btn_send = tk.Button(
+                main_frame,
+                text="Przetwórz i wyślij do bazy",
+                bg="#28a745",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                height=2,
+                command=self.process_and_upload
+            )
+            self.btn_send.pack(fill=tk.X, pady=20)
+
+            self.status_lbl = tk.Label(self, text="Gotowy", anchor=tk.W, relief=tk.SUNKEN, bd=1)
+            self.status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def browse_file(self):
+            path = filedialog.askopenfilename(filetypes=[("Plik CSV", "*.csv")])
+            if path:
+                self.selected_path.set(path)
+
+        def process_and_upload(self):
+            path = self.selected_path.get()
+            if path == "Nie wybrano pliku":
+                messagebox.showwarning("Błąd", "Najpierw wybierz plik CSV!")
+                return
+
+            self.status_lbl.config(text="Przetwarzanie pliku...", fg="blue")
+            self.update()
+
+            # Logika filtrowania (Twój skrypt)
+            mapa_danych = defaultdict(lambda: defaultdict(list))
+            try:
+                with open(path, mode='r', encoding='utf-8-sig') as plik:
+                    reader = csv.DictReader(plik, delimiter=',')  # Możesz dodać wykrywanie separatora
+
+                    wymagane_kolumny = ['NUMERY GŁÓWNE', 'Element Menu']
+                    if not all(col in reader.fieldnames for col in wymagane_kolumny):
+                        messagebox.showerror("Błąd struktury", f"Plik musi zawierać kolumny: {wymagane_kolumny}")
+                        return
+
+                    for rzad in reader:
+                        numer = rzad['NUMERY GŁÓWNE'].strip()
+                        element_menu = rzad['Element Menu']
+
+                        if '-' in element_menu:
+                            czesci = element_menu.split('-', 1)
+                            branza = czesci[0].strip().lower()
+                            zrodlo = czesci[1].strip().lower()
+                            mapa_danych[branza][zrodlo].append(numer)
+
+                if not mapa_danych:
+                    messagebox.showwarning("Pusto",
+                                           "Nie wyciągnięto żadnych danych z pliku (sprawdź format 'Element Menu').")
+                    return
+
+                # Wysyłka do API
+                self.status_lbl.config(text="Wysyłanie do API...", fg="orange")
+                self.update()
+
+                # Payload to po prostu mapa_danych skonwertowana na zwykły dict
+                payload = {k: dict(v) for k, v in mapa_danych.items()}
+
+                response = requests.post(
+                    f"{config.API_URL}/stats-data",
+                    json=payload,
+                    params={"token": config.TOKEN},
+                    timeout=10
+                )
+
+                if response.status_code in [200, 201]:
+                    messagebox.showinfo("Sukces", f"Dane zostały zapisane!\nOtrzymano ID: {response.json().get('id')}")
+                    self.status_lbl.config(text="Zakończono pomyślnie", fg="green")
+                else:
+                    messagebox.showerror("Błąd API", f"Serwer zwrócił błąd {response.status_code}:\n{response.text}")
+                    self.status_lbl.config(text="Błąd wysyłania", fg="red")
+
+            except Exception as e:
+                messagebox.showerror("Błąd krytyczny", f"Wystąpił nieoczekiwany błąd:\n{str(e)}")
+                self.status_lbl.config(text="Błąd krytyczny", fg="red")
