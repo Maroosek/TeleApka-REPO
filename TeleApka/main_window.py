@@ -118,7 +118,8 @@ class AlertClient:
                                     new_map[clean_nr] = f"{branza.upper()} - {zrodlo.capitalize()}"
 
                     self.ivr_mapping = new_map
-                    print(f"Zaktualizowano mapę IVR: {len(new_map)} numerów.")
+                    created_at = raw_data.get("data", [{}])[0].get("created_at")
+                    print(f"Zaktualizowano mapę IVR: {len(new_map)} numerów - Aktualizacja z: {created_at}")
                 else:
                     print(f"Błąd API /stats-data: {response.status_code}")
 
@@ -210,44 +211,37 @@ class AlertClient:
             candidates.append(utils.normalize_num(str(raw_ivr)))
 
         # 2. KANDYDAT DRUGI: Numer wyciągnięty z 'menu_name' (np. z "Firma - Opis 123456789")
-        # Często Telestrada dokleja numer na końcu nazwy menu, gdy brakuje go w polu ivr
         if menu_name:
-            # Usuwamy spacje i myślniki, szukamy ciągu 9 cyfr
-            # Regex: Znajdź 9 cyfr, które nie mają cyfry przed sobą ani za sobą
             found = re.search(r'(?<!\d)(\d{9})(?!\d)', menu_name.replace(" ", "").replace("-", ""))
             if found:
                 candidates.append(found.group(1))
 
-        # 3. KANDYDAT TRZECI: Pole 'source' (jako ostateczność, często to numer techniczny 22...)
+        # 3. KANDYDAT TRZECI: Pole 'source'
         raw_source = alert.get('source')
         if raw_source:
             candidates.append(utils.normalize_num(str(raw_source)))
 
         # --- WERYFIKACJA KANDYDATÓW W MAPIE ---
-        display_menu = menu_name  # Domyślnie wyświetlamy to co przyszło z API
+        display_menu = menu_name
         matched_key = None
 
         for num in candidates:
             if num and num in self.ivr_mapping:
                 display_menu = self.ivr_mapping[num]
                 matched_key = num
-                break  # Znaleźliśmy pasujący numer, przerywamy pętlę!
+                break
 
-        # Logowanie dla debugowania (opcjonalne)
+        # Logowanie (opcjonalne)
         if matched_key:
             print(f"✅ DOPASOWANO: {matched_key} -> {display_menu}")
         elif candidates:
-            # Pokaż po jakich numerach próbowaliśmy szukać
-            print(f"❌ BRAK W MAPIE. Kandydaci: {candidates} (Oryginał: {menu_name})")
-        # ----------------------------------------------------
+            print(f"❌ BRAK W MAPIE. Kandydaci: {candidates}")
 
         status = alert.get('status')
 
-        # Cenzura i formatowanie dla stanowisk (nie-admin)
+        # Cenzura dla zwykłego użytkownika
         if not self.is_admin:
             target = re.sub(r'\d+', '', str(target)).lstrip('- ').strip()
-            # Jeśli wyświetlamy oryginalne menu_name, wycinamy numery.
-            # Jeśli wyświetlamy naszą ładną nazwę z mapy (matched_key istnieje), zostawiamy ją w spokoju.
             if not matched_key and display_menu:
                 display_menu = re.sub(r'\d+', '', str(display_menu)).lstrip('- ').strip()
 
@@ -260,14 +254,29 @@ class AlertClient:
 
         h_frame = tk.Frame(c_frame, bg="white")
         h_frame.pack(anchor="w", fill=tk.X)
+
+        # Wyświetlanie dzwoniącego
         lbl = tk.Label(h_frame, text=f"📞 {caller}", font=("Arial", 14, "bold"), bg="white", cursor="hand2")
         lbl.pack(side=tk.LEFT)
         lbl.bind("<Button-1>", lambda e: self.copy_num(caller))
+
+        # Wyświetlanie celu (agent/grupa)
         tk.Label(h_frame, text=f" ➔ {target}", font=("Arial", 14, "bold"), bg="white", fg="#555").pack(side=tk.LEFT)
 
+        # --- WYŚWIETLANIE NAZWY FOLDERU / MENU ---
         if display_menu:
-            tk.Label(c_frame, text=f"📂 {display_menu}", font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(
-                anchor="w")
+            folder_text = f"📂 {display_menu}"
+
+            # DODATEK DLA ADMINA: Pokaż numer IVR obok nazwy
+            if self.is_admin:
+                if matched_key:
+                    # Pokaż numer, który został zmapowany (kolor szary, mniejsza czcionka w myśli, tutaj w nawiasie)
+                    folder_text += f" {matched_key}"
+                elif candidates:
+                    # Jeśli nie zmapowano, pokaż pierwszy numer po którym próbowaliśmy szukać
+                    folder_text += f"   [? {candidates[0]}]"
+
+            tk.Label(c_frame, text=folder_text, font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(anchor="w")
 
     def copy_num(self, n):
         self.root.clipboard_clear();
@@ -280,12 +289,12 @@ class AlertClient:
     def show_help(self):
         h = tk.Toplevel(self.root)
         h.title("Pomoc");
-        h.geometry("300x300")
+        h.geometry("300x350")
         tk.Label(h, text="Kliknij numer, aby skopiować.", pady=20).pack()
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.7 [13.02]"
+                "Wersja 0.71 [16.02]"
                 )
 
         if not self.is_admin:
