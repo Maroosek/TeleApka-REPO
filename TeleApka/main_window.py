@@ -159,12 +159,13 @@ class AlertClient:
             self.root.attributes("-topmost", True)
 
         # Logika dźwięku
+        #TODO sprawdź czy dobrze działa
         moh_cond = any(a.get("status") == "MOH" and a.get("agent_name") for a in self.active_alerts)
         should_play = False
         if moh_cond:
             if self.moh_start_time is None:
                 self.moh_start_time = time.time()
-            elif time.time() - self.moh_start_time >= 3:
+            elif time.time() - self.moh_start_time >= 2:
                 should_play = True
         else:
             self.moh_start_time = None
