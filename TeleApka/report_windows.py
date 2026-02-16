@@ -247,8 +247,10 @@ class DailyReportWindow(tk.Toplevel):
             side=tk.LEFT, padx=10)
         tk.Button(top_frame, text="Zapisz CSV", bg="#28a745", fg="white", command=self.save_to_csv).pack(side=tk.LEFT,
                                                                                                          padx=10)
-        tk.Button(top_frame, text="Zapisz do Bazy", bg="#17a2b8", fg="white", command=self.save_to_db).pack(
-            side=tk.LEFT, padx=10)
+        self.btn_save_db = tk.Button(top_frame, text="Zapisz do Bazy", bg="#17a2b8", fg="white", command=self.save_to_db)
+
+        self.btn_save_db.pack(side=tk.LEFT, padx=10)
+
         tk.Checkbutton(top_frame, text="Rozwijaj szczegóły", variable=self.var_expand_groups, bg="#f8f9fa",
                        command=self.render_tree).pack(side=tk.LEFT, padx=20)
 
@@ -367,6 +369,16 @@ class DailyReportWindow(tk.Toplevel):
                 self.current_report_data = stats
                 self.render_tree()
                 self.status_lbl.config(text=f"Sukces: {count_total} poł.", fg="green")
+
+                today_str = datetime.now().strftime("%Y-%m-%d")
+
+                if date_val == today_str:
+                    self.btn_save_db.pack_forget()
+                else:
+                    # jeśli wcześniej był schowany, pokaż go z powrotem
+                    if not self.btn_save_db.winfo_ismapped():
+                        self.btn_save_db.pack(side=tk.LEFT, padx=10)
+
             else:
                 self.status_lbl.config(text=f"Błąd API: {resp.status_code}", fg="red")
         except Exception as e:
