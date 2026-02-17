@@ -38,6 +38,12 @@ class AlertClient:
         self.is_sound_playing = False
         self.moh_start_time = None
 
+        self.time_window = 15 * 60  # Okres czasu w sekundach (np. 15 minut = 900 sekund)
+        self.load_threshold = 4  # Ile odebranych połączeń w podanym czasie wyzwala alert
+        self.answered_calls_history = {}  # Format: { call_id: {"agent_key": "Agent [Dział]", "time": timestamp} }
+        self.dismissed_counts = {}  # Zapisuje przy jakiej liczbie admin kliknął "Ukryj"
+        self.current_overload_counts = {}  # Pomocnicza zmienna do odklikiwania
+
         self.setup_ui()
 
         # Uruchomienie pętli sieciowej
@@ -51,6 +57,9 @@ class AlertClient:
         self.root.after(500, self.update_gui)
 
     def setup_ui(self):
+        self.top_alert_frame = tk.Frame(self.root)
+        self.top_alert_frame.pack(side=tk.TOP, fill=tk.X)
+
         self.bottom_bar = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
         self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -69,6 +78,16 @@ class AlertClient:
                       command=lambda: history_window.HistoryWindow(self.root)).pack(side=tk.LEFT, padx=1)
             tk.Button(self.admin_frame, text="Raport", font=("Arial", 8, "bold"), bg="#d1ecf1", width=8,
                       command=lambda: report_windows.show_report_selection(self.root)).pack(side=tk.LEFT, padx=1)
+
+            self.load_warning_frame = tk.Frame(self.top_alert_frame, bg="#ffcc00", bd=2, relief=tk.RAISED)
+
+            self.load_warning_label = tk.Label(self.load_warning_frame, text="", bg="#ffcc00",
+                                               fg="black", font=("Arial", 10, "bold"))
+            self.load_warning_label.pack(side=tk.LEFT, padx=10, pady=5)
+
+            dismiss_btn = tk.Button(self.load_warning_frame, text="✖ Ukryj", font=("Arial", 8, "bold"),
+                                    bg="#ffaa00", command=self.dismiss_load_warning)
+            dismiss_btn.pack(side=tk.RIGHT, padx=10, pady=2)
 
         self.idle_frame = tk.Frame(self.root, bg="#f0f0f0")
         wait_msg = "System czuwa.\nAdmin Mode" if self.is_admin else f"System czuwa.\n{self.assigned_ag}"
@@ -159,7 +178,6 @@ class AlertClient:
             self.root.attributes("-topmost", True)
 
         # Logika dźwięku
-        #TODO sprawdź czy dobrze działa
         moh_cond = any(a.get("status") == "MOH" and a.get("agent_name") for a in self.active_alerts)
         should_play = False
         if moh_cond:
@@ -189,11 +207,88 @@ class AlertClient:
                 self.idle_frame.pack(fill=tk.BOTH, expand=True)
             self.last_data_snapshot = copy.deepcopy(self.active_alerts)
 
+        self.check_agent_loads()
+
         self.root.after(1000, self.update_gui)
 
     def refresh_list(self):
         for w in self.scrollable_frame.winfo_children(): w.destroy()
         for alert in self.active_alerts: self.create_alert_widget(alert)
+
+
+    def check_agent_loads(self):
+        """Monitoruje ilość połączeń na agenta/dział w zadanym oknie czasowym."""
+        if not self.is_admin:
+            return
+
+        current_time = time.time()
+
+        # 1. Zapisywanie nowo odebranych połączeń do pamięci
+        for alert in self.active_alerts:
+            status = alert.get('status')
+            call_id = alert.get('id')
+            agent = alert.get('agent_name')
+
+            # Jeśli połączenie jest odebrane i nie ma go jeszcze w historii
+            if status in ["ANSWERED", "Odebrane"] and call_id and agent:
+                if call_id not in self.answered_calls_history:
+                    menu = alert.get('menu_name', '')
+                    dzial = menu.split('-')[0].strip() if menu and '-' in menu else "Nieznany Dział"
+                    agent_key = f"{agent} [{dzial}]"
+
+                    self.answered_calls_history[call_id] = {
+                        "agent_key": agent_key,
+                        "time": current_time
+                    }
+
+        # 2. Usuwanie starych połączeń (poza okresem np. ostatnich 15 minut)
+        keys_to_delete = [
+            c_id for c_id, data in self.answered_calls_history.items()
+            if current_time - data["time"] > self.time_window
+        ]
+        for c_id in keys_to_delete:
+            del self.answered_calls_history[c_id]
+
+        # 3. Zliczanie połączeń dla poszczególnych agentów w oknie czasowym
+        agent_loads = {}
+        for data in self.answered_calls_history.values():
+            ak = data["agent_key"]
+            agent_loads[ak] = agent_loads.get(ak, 0) + 1
+
+        # 4. Obsługa progów i odklikiwania
+        messages_to_show = []
+
+        # Resetujemy "odkliknięcie" agenta, jeśli jego obciążenie wróciło do normy
+        for ak in list(self.dismissed_counts.keys()):
+            if agent_loads.get(ak, 0) < self.load_threshold:
+                del self.dismissed_counts[ak]
+
+        self.current_overload_counts = {}
+
+        for agent_key, count in agent_loads.items():
+            if count >= self.load_threshold:
+                self.current_overload_counts[agent_key] = count
+                # Wyświetl w banerze tylko, jeśli aktualna ilość przebija tę odklikniętą
+                if count > self.dismissed_counts.get(agent_key, 0):
+                    messages_to_show.append(f"{agent_key}: {count} poł.")
+
+        # 5. Wyświetlanie banera
+        if messages_to_show:
+            mins = int(self.time_window / 60)
+            warn_text = f"⚠ DUŻE OBCIĄŻENIE ({mins} min): " + " | ".join(messages_to_show)
+            self.load_warning_label.config(text=warn_text)
+            self.load_warning_frame.pack(fill=tk.X)
+        else:
+            if hasattr(self, 'load_warning_frame') and self.load_warning_frame.winfo_ismapped():
+                self.load_warning_frame.pack_forget()
+
+
+    def dismiss_load_warning(self):
+        """Zapisuje aktualny stan jako zignorowany, schowa baner aż sytuacja znowu się nie pogorszy."""
+        for agent_key, count in self.current_overload_counts.items():
+            self.dismissed_counts[agent_key] = count
+        self.load_warning_frame.pack_forget()
+
 
     def create_alert_widget(self, alert):
         frame = tk.Frame(self.scrollable_frame, bg="white", bd=2, relief=tk.GROOVE)
@@ -279,6 +374,7 @@ class AlertClient:
 
             tk.Label(c_frame, text=folder_text, font=("Arial", 12, "bold"), fg="#0056b3", bg="white").pack(anchor="w")
 
+
     def copy_num(self, n):
         self.root.clipboard_clear();
         self.root.clipboard_append(n);
@@ -286,6 +382,7 @@ class AlertClient:
         orig = self.status_label.cget("bg")
         self.status_label.config(text=f"✅ Skopiowano: {n}", bg="#d4edda")
         self.root.after(3000, lambda: self.status_label.config(bg=orig))
+
 
     def show_help(self):
         h = tk.Toplevel(self.root)
@@ -295,7 +392,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.71 [16.02]"
+                "Wersja 0.72 [17.02]"
                 )
 
         if not self.is_admin:
@@ -308,6 +405,7 @@ class AlertClient:
         legend_frame = tk.Frame(h)
         legend_frame.pack(fill=tk.X, padx=40)
 
+
         def add_legend_row(color, text):
             row = tk.Frame(legend_frame, pady=3)
             row.pack(fill=tk.X)
@@ -317,6 +415,7 @@ class AlertClient:
         add_legend_row("#007bff", "Niebieski - Dzwoni")
         add_legend_row("#28a745", "Zielony - Odebrane")
         tk.Button(h, text="Zamknij", command=h.destroy, width=15).pack(side=tk.BOTTOM, pady=20)
+
 
     def on_closing(self):
         if messagebox.askyesno("Zamykanie", "Zamknąć monitor?"): self.root.destroy()
