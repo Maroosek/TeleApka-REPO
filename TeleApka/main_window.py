@@ -392,7 +392,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.72 [17.02]"
+                "Wersja 0.73 [18.02]"
                 )
 
         if not self.is_admin:

@@ -13,7 +13,7 @@ import utils
 class StatsComparisonWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.transient(parent)
+        #self.transient(parent)
         self.title("Analiza Trendów - Porównanie")
         self.geometry("1100x700")
 
@@ -193,7 +193,7 @@ class StatsComparisonWindow(tk.Toplevel):
 class DailyReportWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.transient(parent)
+        #self.transient(parent)
         self.title("Wykaz dzienny")
         self.geometry("900x600")
 

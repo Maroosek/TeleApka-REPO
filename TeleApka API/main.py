@@ -482,6 +482,9 @@ async def telestrada_webhook(
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
+    if ivr and len(ivr) == 11 and ivr.startswith("48"):
+        ivr = ivr[2:]
+
     # --- ZMIANA: Logowanie numeru z IVR ---
     if collection_logs is not None:
         try:
@@ -512,8 +515,8 @@ async def telestrada_webhook(
     existing = await collection.find_one({"call_id": id})
     if not existing:
         count = await collection.count_documents({})
-        if count >= 50:
-            print("⚠️ Osiągnięto limit 50 połączeń. Ignoruję nowe.")
+        if count >= 100:
+            print("⚠️ Osiągnięto limit 100 połączeń. Ignoruję nowe.")
             return "LIMIT_REACHED"
 
     caller_num = numer
