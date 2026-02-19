@@ -63,23 +63,95 @@ class HistoryWindow(tk.Toplevel):
     def fetch_data(self):
         if not self.winfo_exists(): return
         try:
+            # --- 1. POBRANIE DANYCH ZE STATYSTYK DO UZUPEŁNIANIA BRAKÓW (FAILSAFE) ---
+            stats_lookup = {}
+            try:
+                stats_response = requests.get(f"{config.API_URL}/stats-data", params={"token": config.TOKEN}, timeout=5)
+                if stats_response.status_code == 200:
+                    stats_json = stats_response.json()
+
+                    # Pobieramy listę z klucza 'data' (zgodnie z Twoim przykładem JSON)
+                    data_list = stats_json.get('data', [])
+
+                    # Iterujemy po liście (zazwyczaj jest tam jeden główny słownik)
+                    for data_item in data_list:
+                        if isinstance(data_item, dict):
+                            for company, groups in data_item.items():
+                                # company np. 'beton polska'
+                                if isinstance(groups, dict):
+                                    for group_name, phones in groups.items():
+                                        # group_name np. 'wizytówki'
+                                        if isinstance(phones, list):
+                                            for phone in phones:
+                                                # Normalizacja numeru (usuwamy spacje, +, prefix 48)
+                                                p_str = str(phone).strip().replace(" ", "").replace("+", "")
+                                                p_base = p_str[2:] if p_str.startswith("48") else p_str
+
+                                                # Tworzymy opis z mapy
+                                                formatted_menu = f"{company} - {group_name}"
+                                                stats_lookup[p_base] = formatted_menu
+            except Exception as e:
+                print(f"Błąd pobierania /stats-data: {e}")
+
+            # --- 2. POBRANIE I GRUPOWANIE HISTORII POŁĄCZEŃ ---
             response = requests.get(f"{config.API_URL}/history", params={"token": config.TOKEN}, timeout=5)
             if response.status_code == 200:
                 logs = response.json().get("logs", [])
                 now = datetime.now()
+
+                unique_logs = {}
+                for log in logs:
+                    # Normalizacja numeru z historii
+                    raw_phone = str(log.get("phone_number", "")).strip().replace(" ", "").replace("+", "")
+                    base_phone = raw_phone[2:] if raw_phone.startswith("48") else raw_phone
+
+                    # Logika grupowania (najnowsze połączenie dla danego numeru)
+                    if base_phone not in unique_logs:
+                        unique_logs[base_phone] = log
+                    else:
+                        existing_date = unique_logs[base_phone].get("last_call", "")
+                        new_date = log.get("last_call", "")
+                        if new_date > existing_date:
+                            unique_logs[base_phone] = log
+
+                # --- 3. PRZETWARZANIE UNIKALNYCH LOGÓW ---
                 new_cache = []
                 count_displayed = 0
-                for log in logs:
-                    raw_phone = log.get("phone_number", "")
-                    fmt_phone = utils.format_phone_number(raw_phone)
+
+                for log in unique_logs.values():
+                    raw_phone_display = str(log.get("phone_number", ""))
+
+                    # Normalizacja do wyszukiwania w mapie (failsafe)
+                    clean_for_lookup = raw_phone_display.strip().replace(" ", "").replace("+", "")
+                    base_phone = clean_for_lookup[2:] if clean_for_lookup.startswith("48") else clean_for_lookup
+
+                    fmt_phone = utils.format_phone_number(raw_phone_display)
                     raw_date = log.get("last_call", "").replace("T", " ").split(".")[0]
+
+                    # --- LOGIKA FAILSAFE ---
+                    menu_raw = log.get("last_menu_full")
+                    menu_str = str(menu_raw).strip() if menu_raw is not None else ""
+
+                    # WARUNEK: Jeśli brak opisu LUB opis krótszy niż 3 znaki -> użyj mapy
+                    if len(menu_str) < 3 or menu_str.lower() in ("none", "null", "-"):
+                        # Pobierz z mapy, jeśli nie ma w mapie -> wstaw "-"
+                        menu = stats_lookup.get(base_phone, "-")
+                    else:
+                        # Jeśli API zwróciło poprawny opis, użyj go
+                        menu = menu_str
+
                     try:
                         call_time = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
                         diff = now - call_time
                         diff_minutes = diff.total_seconds() / 60
                         diff_hours = diff_minutes / 60
-                        if not self.showing_all and diff_hours > 48: continue
+
+                        if not self.showing_all and diff_hours > 48:
+                            continue
+
                         fmt_timediff = str(diff).split(".")[0]
+
+                        # Kolorowanie wierszy
                         row_tag = "normal"
                         if diff_minutes < 15:
                             row_tag = "green"
@@ -89,22 +161,29 @@ class HistoryWindow(tk.Toplevel):
                             row_tag = "red"
 
                         new_cache.append({
-                            'phone': fmt_phone, 'date': raw_date,
-                            'timediff': fmt_timediff, 'menu': log.get("last_menu_full", "-"),
+                            'phone': fmt_phone,
+                            'date': raw_date,
+                            'timediff': fmt_timediff,
+                            'menu': menu,
                             'tags': (row_tag,)
                         })
                         count_displayed += 1
-                    except:
+                    except Exception:
                         if self.showing_all:
                             new_cache.append({
-                                'phone': fmt_phone, 'date': raw_date,
-                                'timediff': "???", 'menu': log.get("last_menu_full", "-"), 'tags': ()
+                                'phone': fmt_phone,
+                                'date': raw_date,
+                                'timediff': "???",
+                                'menu': menu,
+                                'tags': ()
                             })
+
                 self.history_data_cache = new_cache
                 self.refresh_tree_view()
                 self.title(f"Historia Połączeń (Wyświetlono: {count_displayed})")
         except Exception as e:
             print(f"Błąd pobierania historii: {e}")
+
         self.after(60000, self.fetch_data)
 
     def refresh_tree_view(self):

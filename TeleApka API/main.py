@@ -482,9 +482,6 @@ async def telestrada_webhook(
     if collection is None:
         raise HTTPException(status_code=503, detail="Brak bazy danych")
 
-    if ivr and len(ivr) == 11 and ivr.startswith("48"):
-        ivr = ivr[2:]
-
     # --- ZMIANA: Logowanie numeru z IVR ---
     if collection_logs is not None:
         try:
