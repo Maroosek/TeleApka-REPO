@@ -98,13 +98,15 @@ class AlertClient:
         self.scrollbar = tk.Scrollbar(self.canvas_frame, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = tk.Frame(self.canvas, bg="#ffffff")
 
-        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.scrollable_frame.bind("<Configure>", self._update_scrollregion)
         self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
+
+        # Używamy nowej metody _on_canvas_configure zamiast starej lambdy
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)),
                                                                                 "units") if self.canvas_frame.winfo_ismapped() else None)
 
@@ -214,6 +216,33 @@ class AlertClient:
     def refresh_list(self):
         for w in self.scrollable_frame.winfo_children(): w.destroy()
         for alert in self.active_alerts: self.create_alert_widget(alert)
+
+
+    def _update_scrollregion(self, event=None):
+        """Wymusza obszar scrollowania nawet dla małej liczby elementów."""
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+
+        # Pobieramy aktualną wysokość widocznego płótna
+        canvas_height = self.canvas.winfo_height()
+        if canvas_height <= 1:  # Zabezpieczenie na starcie aplikacji
+            canvas_height = self.canvas.winfo_reqheight()
+
+        # Dodajemy mały margines (np. +2 piksele) do wysokości płótna,
+        # aby scroll miał zawsze miejsce do "przeskoku"
+        min_scroll_height = canvas_height + 2
+
+        # Wybieramy większą wartość: rzeczywisty dół zawartości ALBO wymuszone minimum
+        new_bottom = max(bbox[3], min_scroll_height)
+
+        self.canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], new_bottom))
+
+
+    def _on_canvas_configure(self, event):
+        """Dostosowuje szerokość elementów do szerokości okna i przelicza scroll."""
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+        self._update_scrollregion()
 
 
     def check_agent_loads(self):
@@ -383,28 +412,32 @@ class AlertClient:
         self.status_label.config(text=f"✅ Skopiowano: {n}", bg="#d4edda")
         self.root.after(3000, lambda: self.status_label.config(bg=orig))
 
-
     def show_help(self):
         h = tk.Toplevel(self.root)
-        h.title("Pomoc");
-        h.geometry("300x350")
-        tk.Label(h, text="Kliknij numer, aby skopiować.", pady=20).pack()
+        h.title("Pomoc")
+        h.geometry("300x400")  # Delikatnie zwiększyłem okno, by zmieścić nowy przycisk
+
+        tk.Label(h, text="Kliknij numer, aby skopiować.", pady=10).pack()
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.73 [18.02]"
+                "Wersja 0.731 [20.02]"
                 )
 
         if not self.is_admin:
             desc += f"\n\nWyświetla połączenia skierowane na: {self.assigned_ag or 'Brak'}"
         tk.Label(h, text=desc, justify="center").pack(pady=5)
 
+        # NOWE: Przycisk dodawania użytkowników (tylko dla admina)
+        if self.is_admin:
+            tk.Button(h, text="➕ Dodaj użytkowników", bg="#17a2b8", fg="white", font=("Arial", 9, "bold"),
+                      command=lambda: self.open_add_user_window(h)).pack(pady=10)
+
         tk.Frame(h, height=2, bd=1, relief=tk.SUNKEN).pack(fill=tk.X, padx=20, pady=10)
         tk.Label(h, text="Legenda Kolorów", font=("Arial", 12, "bold")).pack(pady=(5, 10))
 
         legend_frame = tk.Frame(h)
         legend_frame.pack(fill=tk.X, padx=40)
-
 
         def add_legend_row(color, text):
             row = tk.Frame(legend_frame, pady=3)
@@ -416,6 +449,65 @@ class AlertClient:
         add_legend_row("#28a745", "Zielony - Odebrane")
         tk.Button(h, text="Zamknij", command=h.destroy, width=15).pack(side=tk.BOTTOM, pady=20)
 
+    def open_add_user_window(self, help_window):
+        # Zamknięcie okna pomocy
+        help_window.destroy()
+
+        # Tworzenie nowego okna
+        add_win = tk.Toplevel(self.root)
+        add_win.title("Dodaj nowego użytkownika")
+        add_win.geometry("350x250")
+        add_win.grab_set()  # Blokuje interakcję z głównym oknem do czasu zamknięcia tego
+
+        # Pola formularza
+        tk.Label(add_win, text="Nazwa użytkownika (login):", font=("Arial", 10)).pack(pady=(15, 2))
+        username_entry = tk.Entry(add_win, width=35)
+        username_entry.pack(pady=5)
+
+        tk.Label(add_win, text="Numery/Grupy (oddzielone przecinkiem):", font=("Arial", 10)).pack(pady=(10, 2))
+        assigned_ag_entry = tk.Entry(add_win, width=35)
+        assigned_ag_entry.pack(pady=5)
+
+        def submit_new_user():
+            username = username_entry.get().strip()
+            ag_raw = assigned_ag_entry.get().strip()
+
+            if not username or not ag_raw:
+                messagebox.showwarning("Braki w danych", "Proszę wypełnić wszystkie pola!", parent=add_win)
+                return
+
+            # Parsowanie wpisanych numerów/grup do listy, pomijając puste spacje
+            assigned_ag_list = [item.strip() for item in ag_raw.split(',') if item.strip()]
+
+            # Budowanie payloadu zgodnie ze specyfikacją
+            payload = {
+                "username": username,
+                "assigned_ag": assigned_ag_list,
+                "is_admin": False
+            }
+
+            try:
+                # UWAGA: Podmień "/users" na prawidłowy endpoint w Twoim API
+                endpoint_url = f"{config.API_URL}/users"
+
+                # Używamy JSON do automatycznego ustawienia nagłówka Content-Type na application/json
+                #stats_response = requests.get(f"{config.API_URL}/stats-data", params={"token": config.TOKEN}, timeout=5)
+                response = requests.post(endpoint_url, json=payload, params={"token": config.TOKEN}, timeout=5)
+
+                if response.status_code in (200, 201):
+                    messagebox.showinfo("Sukces", f"Pomyślnie dodano użytkownika: {username}", parent=add_win)
+                    add_win.destroy()
+                else:
+                    messagebox.showerror("Błąd API",
+                                         f"Nie udało się dodać użytkownika.\nStatus: {response.status_code}\nOdpowiedź: {response.text}",
+                                         parent=add_win)
+
+            except requests.exceptions.RequestException as e:
+                messagebox.showerror("Błąd połączenia", f"Brak komunikacji z serwerem:\n{e}", parent=add_win)
+
+        # Przycisk zatwierdzający
+        tk.Button(add_win, text="Zapisz użytkownika", bg="#28a745", fg="white", font=("Arial", 10, "bold"),
+                  command=submit_new_user).pack(pady=20)
 
     def on_closing(self):
         if messagebox.askyesno("Zamykanie", "Zamknąć monitor?"): self.root.destroy()
