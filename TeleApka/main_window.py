@@ -6,6 +6,7 @@ import time
 import copy
 import re
 import requests
+import ctypes
 
 import config
 import utils
@@ -29,6 +30,19 @@ class AlertClient:
         self.root.title(f"Monitor połączeń JET - {self.username} [{role_info}]")
         self.root.geometry("500x450")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        try:
+            # Nadajemy aplikacji unikalny identyfikator (możesz wpisać cokolwiek)
+            myappid = 'mojafirma.monitorjet.wersja.0.731'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass  # Zignoruj, jeśli aplikacja zostanie uruchomiona na innym systemie (np. Linux)
+
+        # 3. Ustawienie ikony w lewym górnym rogu okna
+        try:
+            self.root.iconbitmap(utils.get_resource_path('app.ico'))
+        except Exception as e:
+            print(f"Nie udało się załadować ikony: {e}")
 
         # Stan
         self.api_connected = True
@@ -57,8 +71,8 @@ class AlertClient:
         self.root.after(500, self.update_gui)
 
     def setup_ui(self):
-        self.top_alert_frame = tk.Frame(self.root)
-        self.top_alert_frame.pack(side=tk.TOP, fill=tk.X)
+        # self.top_alert_frame = tk.Frame(self.root)
+        # self.top_alert_frame.pack(side=tk.TOP, fill=tk.X)
 
         self.bottom_bar = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
         self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -79,15 +93,18 @@ class AlertClient:
             tk.Button(self.admin_frame, text="Raport", font=("Arial", 8, "bold"), bg="#d1ecf1", width=8,
                       command=lambda: report_windows.show_report_selection(self.root)).pack(side=tk.LEFT, padx=1)
 
-            self.load_warning_frame = tk.Frame(self.top_alert_frame, bg="#ffcc00", bd=2, relief=tk.RAISED)
+            # ZMIANA: Podpinamy load_warning_frame bezpośrednio pod self.root
+            self.load_warning_frame = tk.Frame(self.root, bg="#ffcc00", bd=2, relief=tk.RAISED)
 
+            # ZMIANA: Tworzymy i pakujemy przycisk "Ukryj" jako PIERWSZY z lewej strony
+            dismiss_btn = tk.Button(self.load_warning_frame, text="✖ Ukryj", font=("Arial", 8, "bold"),
+                                    bg="#ffaa00", command=self.dismiss_load_warning)
+            dismiss_btn.pack(side=tk.LEFT, padx=10, pady=2)
+
+            # ZMIANA: Etykietę pakujemy jako drugą, więc pojawi się po prawej stronie od przycisku
             self.load_warning_label = tk.Label(self.load_warning_frame, text="", bg="#ffcc00",
                                                fg="black", font=("Arial", 10, "bold"))
             self.load_warning_label.pack(side=tk.LEFT, padx=10, pady=5)
-
-            dismiss_btn = tk.Button(self.load_warning_frame, text="✖ Ukryj", font=("Arial", 8, "bold"),
-                                    bg="#ffaa00", command=self.dismiss_load_warning)
-            dismiss_btn.pack(side=tk.RIGHT, padx=10, pady=2)
 
         self.idle_frame = tk.Frame(self.root, bg="#f0f0f0")
         wait_msg = "System czuwa.\nAdmin Mode" if self.is_admin else f"System czuwa.\n{self.assigned_ag}"
@@ -306,7 +323,18 @@ class AlertClient:
             mins = int(self.time_window / 60)
             warn_text = f"⚠ DUŻE OBCIĄŻENIE ({mins} min): " + " | ".join(messages_to_show)
             self.load_warning_label.config(text=warn_text)
-            self.load_warning_frame.pack(fill=tk.X)
+
+            # ZMIANA: Wymuszamy, aby baner wskoczył na samą górę, odpychając zawartość w dół
+            target = None
+            if self.canvas_frame.winfo_ismapped():
+                target = self.canvas_frame
+            elif self.idle_frame.winfo_ismapped():
+                target = self.idle_frame
+
+            if target:
+                self.load_warning_frame.pack(side=tk.TOP, fill=tk.X, before=target)
+            else:
+                self.load_warning_frame.pack(side=tk.TOP, fill=tk.X)
         else:
             if hasattr(self, 'load_warning_frame') and self.load_warning_frame.winfo_ismapped():
                 self.load_warning_frame.pack_forget()
@@ -421,7 +449,7 @@ class AlertClient:
         desc = ("Aplikacja monitoruje system telefoniczny Telestrada.\n"
                 "Kliknij numer telefonu, aby go skopiować.\n"
                 "(Działa w oknie głównym i w Historii)\n"
-                "Wersja 0.731 [20.02]"
+                "Wersja 0.732 [23.02]"
                 )
 
         if not self.is_admin:

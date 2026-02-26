@@ -1,5 +1,6 @@
 # utils.py
 import os
+import sys
 
 # Obsługa dźwięku
 try:
@@ -40,3 +41,9 @@ def stop_sound():
             winsound.PlaySound(None, winsound.SND_PURGE)
         except Exception as e:
             print(f"Błąd zatrzymania dźwięku: {e}")
+
+def get_resource_path(relative_path):
+    # PyInstaller ustawia sys._MEIPASS na folder tymczasowy lub główny folder aplikacji
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
