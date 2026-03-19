@@ -42,7 +42,6 @@ def bitrix_call(webhook_url, method, params=None):
                 print("❌ Błąd krytyczny: Nie udało się połączyć po wszystkich próbach.")
                 return {"error": str(e)}
 
-
 def clean_phone_number(phone):
     """
     Usuwa WSZYSTKIE znaki niebędące cyframi.

@@ -1,98 +1,72 @@
 import os
-from fastapi import FastAPI, HTTPException, Query, Request, Response, Body
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
+import httpx
+from typing import Optional
+from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
-from typing import List, Optional
 from pymongo.errors import DuplicateKeyError
 from urllib.parse import parse_qs
-import httpx
 
 from Bitrix24 import find_owner_by_incoming_sms, add_new_activity
-from config import Telestrada
 
-# Próba importu konfigu
+# Konfiguracja
 try:
-    from config import MongoCredentials
-
+    from config import MongoCredentials, Config_PlFon, Config_Auth
     mongo_url = MongoCredentials.MONGODB_URL
     db_name = MongoCredentials.DATABASE_NAME
-    collection_name = MongoCredentials.COLLECTION_NAME
-    collection_users_name = MongoCredentials.COLLECTION_USERS
-    collection_logs_name = MongoCredentials.COLLECTION_HISTORY
-    collection_sms_name = MongoCredentials.COLLECTION_SMS
-    collection_stats_name = MongoCredentials.COLLECTION_STATS
-    collection_stats_data_name = MongoCredentials.COLLECTION_STATS_DATA
-    GLOBAL_ACCESS_TOKEN = MongoCredentials.GLOBAL_ACCESS_TOKEN
-    port = int(os.getenv("PORT", 8020))
+    collection_SMS = MongoCredentials.COLLECTION_SMS
+    collection_SMS_SEND = MongoCredentials.COLLECTION_SMS_SEND
+    PLFON_USERNAME = Config_PlFon.PLFON_USERNAME
+    PLFON_URL = Config_PlFon.PLFON_URL
+    PLFON_PASSWORD = Config_PlFon.PLFON_PASSWORD
+    PLFON_FROM = Config_PlFon.PLFON_FROM
+    API_AUTH_TOKEN = Config_Auth.API_TOKEN
+
 except ImportError:
     mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     db_name = os.getenv("DATABASE_NAME", "system_powiadomien")
-    collection_name = os.getenv("COLLECTION_NAME", "alerts")
-    collection_users_name = os.getenv("COLLECTION_USERS", "user")
-    collection_logs_name = os.getenv("COLLECTION_HISTORY", "history")
-    collection_stats_name = os.getenv("COLLECTION_STATS", "stats")
-    collection_stats_data_name = os.getenv("COLLECTION_STATS_DATA", "statsData")
-    collection_sms_name = os.getenv("COLLECTION_SMS", "smsReceived")
-    GLOBAL_ACCESS_TOKEN = os.getenv("GLOBAL_ACCESS_TOKEN", "admin123")
-    port = int(os.getenv("PORT", 8020))
+    collection_SMS = os.getenv("COLLECTION_SMS", "sms_incoming")
+    collection_SMS_SEND = os.getenv("COLLECTION_SMS_SEND", "sms_outgoing")
+    API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "super-tajny-token-123")
 
-# Zmienne globalne
-client: Optional[AsyncIOMotorClient] = None
-collection = None
-collection_users = None
-collection_logs = None
-collection_sms = None
-collection_stats = None
-collection_stats_data = None
+port = int(os.getenv("PORT", 8020))
 
+# Zmienne globalne na kolekcje
+collection_incoming: Optional[object] = None
+collection_outgoing: Optional[object] = None
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, collection, collection_users, collection_logs, collection_sms, collection_stats, collection_stats_data
+    global collection_incoming, collection_outgoing
+
     print("LOG: Uruchamianie serwera... Łączenie z MongoDB.")
+    client = None
 
     try:
         client = AsyncIOMotorClient(mongo_url)
         db = client[db_name]
 
-        collection = db[collection_name]
-        collection_users = db[collection_users_name]
-        collection_logs = db[collection_logs_name]
-        collection_sms = db[collection_sms_name]
-        collection_stats = db[collection_stats_name]
-        collection_stats_data = db[collection_stats_data_name]
+        collection_incoming = db[collection_SMS]
+        collection_outgoing = db[collection_SMS_SEND]
 
         print(f"✅ POŁĄCZONO Z MONGODB: {db_name}")
-
-        try:
-            await collection.create_index("call_id", unique=True)
-        except Exception as e:
-            print(f"⚠️ Nie udało się utworzyć indeksu dla ALERTS: {e}")
-
-        try:
-            await collection_users.create_index("username", unique=True)
-        except Exception as e:
-            print(f"⚠️ Nie udało się utworzyć indeksu dla USERS: {e}")
-
-        try:
-            await collection_logs.create_index("phone_number", unique=True)
-        except Exception as e:
-            print(f"⚠️ Nie udało się utworzyć indeksu dla HISTORY: {e}")
 
     except Exception as e:
         print(f"❌ KRYTYCZNY BŁĄD POŁĄCZENIA Z BAZĄ: {e}")
 
     yield
+
     print("LOG: Zamykanie serwera.")
     if client:
         client.close()
 
 
-app = FastAPI(lifespan=lifespan, title="System Powiadomień API - Telestrada")
+app = FastAPI(lifespan=lifespan, title="System SMSowni PlFon")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,445 +76,242 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+security = HTTPBearer()
 
-# --- MODELE DANYCH ---
-class AlertSchema(BaseModel):
-    id: str
-    call_id: str
-    caller: str
-    source: str
-    message: str
-    menu_name: Optional[str] = None
-    agent_name: Optional[str] = None
-    status: Optional[str] = None
-    timestamp: datetime
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    Sprawdza, czy token Bearer przekazany w nagłówku Authorization
+    zgadza się z tokenem zapisanym w konfiguracji (API_AUTH_TOKEN).
+    """
+    if credentials.credentials != API_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Nieprawidłowy lub brakujący token autoryzacyjny",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
 
+# --- MODELE ---
 
-class UserCreate(BaseModel):
-    username: str
-    assigned_ag: Optional[List[str]] = None
-    is_admin: bool = False
-
-
-class LoginSchema(BaseModel):
-    username: str
-    token: str
-
-
-class StatusResponse(BaseModel):
-    status: str
-    count: int
-    alerts: List[AlertSchema]
-
-
-class LogEntrySchema(BaseModel):
-    id: str
-    phone_number: str
-    last_call: datetime
-    last_menu_full: Optional[str] = None
-
-
-class HistoryResponse(BaseModel):
-    count: int
-    logs: List[LogEntrySchema]
-
+class SendSMSRequest(BaseModel):
+    to: str          # numer(y) B w formacie e164, np. "48510123123" lub kilka po przecinku
+    text: str        # treść SMS (max 918 znaków bez polskich znaków / 402 ze znakami specjalnymi)
+    from_: Optional[str] = None  # opcjonalne nadpisanie nadawcy
 
 # --- ENDPOINTY ---
 
 @app.get("/")
 async def root():
-    return {"message": "API Telestrady działa", "docs": "/docs"}
+    return {"message": "API SMSowni 2.0", "docs": "/docs"}
 
-
-@app.post("/login")
-async def login(data: LoginSchema):
-    if collection_users is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych")
-
-    if data.token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    user = await collection_users.find_one({"username": data.username})
-    if not user:
-        raise HTTPException(status_code=404, detail="Taki użytkownik nie istnieje.")
-
-    # ZMIANA: Normalizacja assigned_ag
-    raw_assigned = user.get("assigned_ag")
-    assigned_list = []
-
-    if raw_assigned:
-        if isinstance(raw_assigned, list):
-            assigned_list = raw_assigned
-        else:
-            assigned_list = [str(raw_assigned)]
-
-    return {
-        "message": "Zalogowano",
-        "username": user["username"],
-        "is_admin": user.get("is_admin", False),
-        "assigned_ag": assigned_list
-    }
-
-
-@app.get("/status", response_model=StatusResponse)
-async def get_status():
-    if collection is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych")
-
-    cursor = collection.find().sort("last_updated", -1).limit(25)
-    alerts_docs = await cursor.to_list(length=25)
-
-    mapped_alerts = []
-    for doc in alerts_docs:
-        mapped_alerts.append({
-            "id": str(doc["_id"]),
-            "call_id": doc.get("call_id", "manual"),
-            "ivr": doc.get("ivr", "Nieznany"),
-            "caller": doc.get("caller", "Nieznany"),
-            "source": doc.get("source", "Nieznane"),
-            "message": doc.get("message", ""),
-            "menu_name": doc.get("menu_name"),
-            "agent_name": doc.get("agent_name"),
-            "status": doc.get("status"),
-            "answered": doc.get("answered", False),
-            "timestamp": doc.get("last_updated", datetime.now())
-        })
-
-    return {
-        "status": "ok",
-        "count": len(mapped_alerts),
-        "alerts": mapped_alerts
-    }
-
-
-@app.post("/stats", status_code=201)
-async def add_stats(payload: dict = Body(...)):
+# -----------------------------------------------------------------------
+# Odbieranie SMS-ów przychodzących od plfon.pl
+# -----------------------------------------------------------------------
+@app.get("/plfon/receivedSMS", operation_id="receive_sms_get")
+@app.post("/plfon/receivedSMS", operation_id="receive_sms_post")
+async def receive_sms(request: Request):
     """
-    Zapisuje raport statystyczny.
+    Webhook wywoływany przez plfon.pl przy każdym przychodzącym SMS-ie.
+    Obsługuje GET (parametry URL) oraz POST (form-data lub JSON).
     """
-    if collection_stats is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
-
-    if "date" not in payload:
-        raise HTTPException(status_code=400, detail="Brak pola 'date' (YYYY-MM-DD) w przesłanym JSON.")
-
-    try:
-        payload["_created_at"] = datetime.now()
-        result = await collection_stats.insert_one(payload)
-        return {"status": "saved", "id": str(result.inserted_id)}
-    except Exception as e:
-        print(f"❌ Błąd zapisu statystyk: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/stats")
-async def get_stats(
-        date_from: str = Query(..., description="Data początkowa (YYYY-MM-DD)", example="2026-02-01"),
-        date_to: str = Query(..., description="Data końcowa (YYYY-MM-DD)", example="2026-02-28"),
-        token: str = Query(..., description="Token administratora")
-):
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    if collection_stats is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych statystyk")
-
-    try:
-        query = {
-            "date": {
-                "$gte": date_from,
-                "$lte": date_to
-            }
-        }
-
-        cursor = collection_stats.find(query).sort("date", 1)
-        stats_docs = await cursor.to_list(length=None)
-
-        mapped_stats = []
-        for doc in stats_docs:
-            doc["id"] = str(doc.pop("_id"))
-            if "_created_at" in doc:
-                del doc["_created_at"]
-            mapped_stats.append(doc)
-
-        return {
-            "count": len(mapped_stats),
-            "date_from": date_from,
-            "date_to": date_to,
-            "data": mapped_stats
-        }
-
-    except Exception as e:
-        print(f"❌ Błąd odczytu statystyk: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# --- NOWY ENDPOINT POST ---
-@app.post("/stats-data", status_code=201)
-async def add_stats_data(
-        payload: dict = Body(...),
-        token: str = Query(..., description="Token administratora")
-):
-    """
-    Zapisuje dane konfiguracyjne do statystyk.
-    Dodaje automatycznie pole created_at.
-    """
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    if collection_stats_data is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych stats_data")
-
-    try:
-        # Dodajemy datę stworzenia
-        payload["created_at"] = datetime.now()
-
-        result = await collection_stats_data.insert_one(payload)
-
-        return {
-            "status": "saved",
-            "id": str(result.inserted_id),
-            "created_at": payload["created_at"]
-        }
-    except Exception as e:
-        print(f"❌ Błąd zapisu stats_data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# --- ZMODYFIKOWANY ENDPOINT GET ---
-@app.get("/stats-data")
-async def get_stats_data_list(token: str = Query(..., description="Token administratora")):
-    """
-    Pobiera dane konfiguracyjne do statystyk.
-    Zwraca tylko NAJNOWSZY wpis (sortowanie po created_at malejąco).
-    """
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    if collection_stats_data is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych stats_data")
-
-    try:
-        # Pobieramy tylko jeden, najnowszy rekord
-        cursor = collection_stats_data.find().sort("created_at", -1).limit(1)
-        docs = await cursor.to_list(length=1)
-
-        mapped_data = []
-        for doc in docs:
-            doc["id"] = str(doc.pop("_id"))
-            mapped_data.append(doc)
-
-        return {
-            "count": len(mapped_data),
-            "data": mapped_data
-        }
-
-    except Exception as e:
-        print(f"❌ Błąd odczytu stats_data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/telestrada/connections")
-async def get_telestrada_connections(
-        date: str = Query(..., description="Data w formacie YYYY-MM-DD", example="2026-02-05"),
-        token: str = Query(..., description="Token administratora")
-):
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    api_key = getattr(Telestrada, "API_KEY", None)
-    if not api_key:
-        api_key = os.getenv("TELESTRADA_API_KEY")
-
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Brak skonfigurowanego klucza API Telestrady.")
-
-    url = "https://api.telestrada.pl/api/v1/callcontact/connections"
-    headers = {
-        "api-key": api_key,
-        "Accept": "application/json"
-    }
-    params = {
-        "date": date
-    }
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Błąd API Telestrady: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Błąd połączenia z Telestradą: {str(e)}")
-
-
-@app.get("/history", response_model=HistoryResponse)
-async def get_history(token: str = Query(..., description="Token administratora")):
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    if collection_logs is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych logów")
-
-    cursor = collection_logs.find().sort("last_call", -1)
-    logs_docs = await cursor.to_list(length=None)
-
-    mapped_logs = []
-    for doc in logs_docs:
-        mapped_logs.append({
-            "id": str(doc["_id"]),
-            "phone_number": doc.get("phone_number"),
-            "last_call": doc.get("last_call"),
-            "last_menu_full": doc.get("last_menu_full")
-        })
-
-    return {
-        "count": len(mapped_logs),
-        "logs": mapped_logs
-    }
-
-
-@app.post("/users", status_code=201)
-async def create_user(user: UserCreate, token: str):
-    if collection_users is None:
-        raise HTTPException(status_code=503, detail="Brak połączenia z bazą użytkowników")
-
-    user_data = user.dict()
-
-    if token != GLOBAL_ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Nieprawidłowy kod dostępu (token).")
-
-    try:
-        result = await collection_users.insert_one(user_data)
-        return {"message": "Użytkownik dodany", "username": user.username, "id": str(result.inserted_id)}
-    except DuplicateKeyError:
-        raise HTTPException(status_code=409, detail=f"Użytkownik '{user.username}' już istnieje.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd bazy: {str(e)}")
-
-
-@app.post("/SMSAPI/addSMS")
-async def add_sms(request: Request):
-    if collection_sms is None:
+    if collection_incoming is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
     try:
-        body_bytes = await request.body()
-        body_str = body_bytes.decode("utf-8")
-        data = parse_qs(body_str)
+        # Wyciąganie danych w zależności od metody HTTP
+        if request.method == "GET":
+            sms_from = request.query_params.get("from")
+            sms_to = request.query_params.get("to")
+            sms_text = request.query_params.get("text")
+            receive_date_raw = request.query_params.get("receive_date")
+        else:
+            content_type = request.headers.get("content-type", "")
 
-        def get_val(key):
-            return data.get(key, [None])[0]
+            # Obsługa POST: form-data lub JSON
+            if "application/json" in content_type:
+                data_raw = await request.json()
+                sms_from = data_raw.get("from")
+                sms_to = data_raw.get("to")
+                sms_text = data_raw.get("text")
+                receive_date_raw = data_raw.get("receive_date")
+            else:
+                body_bytes = await request.body()
+                body_str = body_bytes.decode("utf-8")
+                data = parse_qs(body_str)
 
-        sms_to = get_val("sms_to")
-        sms_from = get_val("sms_from")
-        sms_text = get_val("sms_text")
-        # sms_date = get_val("sms_date")
-        # username = get_val("username")
-        # msg_id_raw = get_val("MsgId")
+                def get_val(key):
+                    return data.get(key, [None])[0]
 
-        print("🔄 Próba dodania aktywności do Bitrix24...")
+                sms_from = get_val("from")
+                sms_to = get_val("to")
+                sms_text = get_val("text")
+                receive_date_raw = get_val("receive_date")
+
+        # Walidacja wymaganych pól
+        if not sms_from or not sms_text:
+            print(f"⚠️ Brakujące pola: from={sms_from}, text={sms_text}")
+            return Response(content="OK", media_type="text/plain")
+
+        # Konwersja unix timestamp → datetime
+        receive_date = (
+            datetime.fromtimestamp(int(receive_date_raw))
+            if receive_date_raw
+            else datetime.utcnow()
+        )
+
+        print(f"📨 SMS od {sms_from} → {sms_to}: {sms_text[:50]}...")
+
+        # Zapis do MongoDB
+        sms_doc = {
+            "from": sms_from,
+            "to": sms_to,
+            "text": sms_text,
+            "receive_date": receive_date,
+            "created_at": datetime.utcnow(),
+        }
 
         try:
-            bitrixData = find_owner_by_incoming_sms(sms_from)
-            if bitrixData:
-                owner_id = bitrixData["OWNER_ID"]
-                owner_type = bitrixData["OWNER_TYPE_ID"]
-                responsible = bitrixData.get("RESPONSIBLE_ID", "1")
-                description = f"[B]SMS od:[/B] {sms_from}\n[B]Treść:[/B]\n{sms_text}"
-                add_new_activity(owner_id, owner_type, responsible, description)
-            else:
-                print("ℹ️ Nie dodano aktywności do Bitrix (brak powiązanego Deala/Leada).")
-        except Exception as e:
-            print(f"❌ Błąd integracji Bitrix: {e}")
-            import traceback
-            traceback.print_exc()
+            await collection_incoming.insert_one(sms_doc)
+            print("✅ SMS zapisany w bazie.")
+        except DuplicateKeyError:
+            print("⚠️ Duplikat SMS – ignoruję.")
 
-        return Response(content="OK", media_type="text/plain")
+        # Integracja z Bitrix24
+        # try:
+        #     bitrix_data = find_owner_by_incoming_sms(sms_from)
+        #     if bitrix_data:
+        #         owner_id = bitrix_data["OWNER_ID"]
+        #         owner_type = bitrix_data["OWNER_TYPE_ID"]
+        #         responsible = bitrix_data.get("RESPONSIBLE_ID", "1")
+        #         description = (
+        #             f"[B]SMS od:[/B] {sms_from}\n"
+        #             f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        #             f"[B]Treść:[/B]\n{sms_text}"
+        #         )
+        #         add_new_activity(owner_id, owner_type, responsible, description)
+        #         print(f"✅ Aktywność dodana do Bitrix24 (owner: {owner_id}).")
+        #     else:
+        #         print("ℹ️ Brak powiązanego Deala/Leada w Bitrix24.")
+        # except Exception as e:
+        #     import traceback
+        #     print(f"❌ Błąd integracji Bitrix24: {e}")
+        #     traceback.print_exc()
+        #
+        # return Response(content="OK", media_type="text/plain")
 
-    except DuplicateKeyError:
-        print(f"⚠️ Duplikat SMS. Ignoruję.")
-        return Response(content="OK", media_type="text/plain")
     except Exception as e:
-        print(f"❌ Błąd ogólny zapisu SMS: {e}")
+        import traceback
+        print(f"❌ Błąd ogólny: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/webhook/telestrada")
-async def telestrada_webhook(
-        ivr: str = Query(..., description="Identyfikator IVR (#ivr_id#)"),
-        id: str = Query(..., description="Unikalne ID połączenia (#call_id#)"),
-        numer: str = Query(..., description="Numer dzwoniącego (#num_a#)"),
-        ag: Optional[str] = Query(None, description="Numer docelowy/agenta (#num_b#)"),
-        czy_trwa: bool = Query(True, description="Status online: true/false (#online#)"),
-        status: Optional[str] = Query(None, description="Status tekstowy (#status#)"),
-        answered: Optional[str] = Query(None, description="Status odpowiedzi (#answered#)"),
-        menu: Optional[str] = Query(None, description="Nazwa menu (#menu_name#)"),
-        agent_name: Optional[str] = Query(None, description="Nazwa agenta (#agent_name#)")
+# -----------------------------------------------------------------------
+# Wysyłanie SMS-ów przez plfon.pl
+# -----------------------------------------------------------------------
+@app.post("/plfon/sendSMS")
+async def send_sms(
+    payload: SendSMSRequest,
+    #token: str = Depends(verify_token)  # Zabezpieczenie Bearer Tokenem
 ):
-    if collection is None:
-        raise HTTPException(status_code=503, detail="Brak bazy danych")
+    """
+    Wysyła SMS przez API plfon.pl.
+    Wymaga nagłówka: Authorization: Bearer <twój_token>
+    Pole 'to' przyjmuje jeden numer lub kilka po przecinku (max 10).
+    Treść 'text' max 918 znaków (bez PL znaków) / 402 znaki (z PL znakami).
+    """
+    if collection_outgoing is None:
+        raise HTTPException(status_code=503, detail="Database not available")
 
-    # --- ZMIANA: Logowanie numeru z IVR ---
-    if collection_logs is not None:
-        try:
-            # Używamy bezpośrednio numeru IVR
-            target_number = ivr
+    if not PLFON_USERNAME or not PLFON_PASSWORD:
+        raise HTTPException(status_code=500, detail="Brak konfiguracji danych logowania plfon.pl")
 
-            # (Opcjonalnie) Możemy dodać walidację czy ivr nie jest puste
-            if target_number:
-                await collection_logs.update_one(
-                    {"phone_number": target_number},
-                    {
-                        "$set": {
-                            "last_call": datetime.now(),
-                            "last_menu_full": menu  # Zapisujemy nazwę menu informacyjnie, jeśli jest
-                        },
-                    },
-                    upsert=True
-                )
-                print(f"💾 Zalogowano połączenie dla numeru IVR: {target_number}")
-        except Exception as e:
-            print(f"❌ Błąd podczas logowania numeru IVR: {e}")
+    # Walidacja liczby odbiorców (max 10 wg dokumentacji)
+    recipients = [r.strip() for r in payload.to.split(",") if r.strip()]
+    if len(recipients) > 10:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Zbyt wielu odbiorców ({len(recipients)}). Maksimum to 10 na jedno wywołanie."
+        )
 
-    if not czy_trwa:
-        print(f"📞 Koniec połączenia {id} ({status}). Usuwam.")
-        await collection.delete_one({"call_id": id})
-        return "OK_DELETED"
+    # Walidacja długości tekstu
+    if len(payload.text) > 918:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tekst zbyt długi ({len(payload.text)} znaków). Maksimum to 918 znaków."
+        )
 
-    existing = await collection.find_one({"call_id": id})
-    if not existing:
-        count = await collection.count_documents({})
-        if count >= 100:
-            print("⚠️ Osiągnięto limit 100 połączeń. Ignoruję nowe.")
-            return "LIMIT_REACHED"
+    sms_from = payload.from_ or PLFON_FROM
 
-    caller_num = numer
-    source_num = ag if ag else (menu if menu else "Infolinia")
-
-    display_message = f"{caller_num} ➡️ {source_num}"
-    if menu: display_message += f" [{menu}]"
-
-    alert_data = {
-        "call_id": id,
-        "ivr": ivr,
-        "caller": caller_num,
-        "source": source_num,
-        "message": display_message,
-        "menu_name": menu,
-        "agent_name": agent_name,
-        "status": status,
-        "answered": answered,
-        "last_updated": datetime.now()
+    request_body = {
+        "username": PLFON_USERNAME,
+        "password": PLFON_PASSWORD,
+        "from": sms_from,
+        "to": payload.to,
+        "text": payload.text,
     }
 
-    await collection.update_one({"call_id": id}, {"$set": alert_data}, upsert=True)
-    print(f"📞 Aktualizacja połączenia {id}: {caller_num} -> {source_num} (Status: {status})")
-    return "OK_UPDATED"
+    # Wymuszenie formatu x-www-form-urlencoded i fałszywy User-Agent, aby obejść 406 Not Acceptable
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            response = await http_client.post(PLFON_URL, data=request_body, headers=headers)
+
+            if response.status_code != 200:
+                print(f"⚠️ Błąd Plfon. Kod: {response.status_code}, Odpowiedź: {response.text}")
+
+            response.raise_for_status()
+
+            # Bezpieczne parsowanie odpowiedzi
+            try:
+                result = response.json()
+            except ValueError:
+                print(f"⚠️ Odpowiedź Plfon nie jest JSON-em: {response.text}")
+                # Fallback, aby aplikacja się nie zawiesiła przy sprawdzaniu 'error_code' i zapisie do bazy
+                result = {
+                    "status": "ok" if response.status_code == 200 else "error",
+                    "error_code": "0" if response.status_code == 200 else str(response.status_code),
+                    "error_message": response.text
+                }
+
+        print(f"📤 Odpowiedź plfon.pl: {result}")
+
+        # Zapis wyniku do MongoDB
+        log_doc = {
+            "from": sms_from,
+            "to": payload.to,
+            "text": payload.text,
+            "recipients_count": len(recipients),
+            "plfon_status": result.get("status"),
+            "plfon_error_code": result.get("error_code"),
+            "plfon_error_message": result.get("error_message"),
+            "sent_at": datetime.utcnow(),
+        }
+        await collection_outgoing.insert_one(log_doc)
+
+        # Sprawdzenie czy plfon zwrócił błąd w swoim API
+        error_code = result.get("error_code")
+        if error_code not in ("0", 0, None):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Błąd plfon.pl [{error_code}]: {result.get('error_message')}"
+            )
+
+        return {
+            "success": True,
+            "status": result.get("status"),
+            "recipients": recipients,
+        }
+
+    except httpx.HTTPError as e:
+        print(f"❌ Błąd HTTP do plfon.pl: {e}")
+        raise HTTPException(status_code=502, detail=f"Błąd połączenia z plfon.pl: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=port)
