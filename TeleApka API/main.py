@@ -212,7 +212,7 @@ async def receive_sms(request: Request):
 @app.post("/plfon/sendSMS")
 async def send_sms(
     payload: SendSMSRequest,
-    #token: str = Depends(verify_token)  # Zabezpieczenie Bearer Tokenem
+    token: str = Depends(verify_token)  # Zabezpieczenie Bearer Tokenem
 ):
     """
     Wysyła SMS przez API plfon.pl.
@@ -318,26 +318,30 @@ from fastapi.responses import HTMLResponse
 #Sekcja bitrixowa
 
 @app.post("/bitrix/send-sms-native")
-async def bitrix_native_sms(request: Request):
+async def bitrix_native_sms(
+    request: Request,
+    token: Optional[str] = None, # Pobierane z URL-a: ?token=...
+    from_: Optional[str] = None  # Pobierane z URL-a: ?from_=...
+):
     """
-    Endpoint, do którego Bitrix24 wysyła żądanie, gdy użytkownik
-    skorzysta z natywnej bramki SMS w karcie Leada/Deala.
-    Bitrix wysyła dane jako formularz (application/x-www-form-urlencoded).
+    Endpoint wywoływany przez Bitrix24 z natywnej bramki.
     """
-    form_data = await request.form()
+    # 1. Weryfikacja tokena przekazanego w URL podczas instalacji bramki
+    if token != API_AUTH_TOKEN:
+        return Response(content="Nieautoryzowany dostęp (zły token)", status_code=401)
 
-    # Bitrix przekazuje w formularzu m.in. te pola:
+    form_data = await request.form()
     phone = form_data.get("message_to")
     text = form_data.get("message_body")
-    message_id = form_data.get("message_id")  # Przydatne, jeśli w przyszłości zechcesz aktualizować status dostarczenia
+    message_id = form_data.get("message_id")
 
-    print(f"📥 Otrzymano żądanie wysyłki z Bitrix24: Do={phone}, Treść={text}")
+    print(f"📥 Żądanie wysyłki Bitrix24: Do={phone}, Nadawca={from_}, Treść={text}")
 
     if not phone or not text:
         return Response(content="Brak wymaganych danych", status_code=400)
 
-    # Przygotowanie danych do wysyłki przez PlFon
-    sms_from = PLFON_FROM
+    # Używamy nadawcy z konfiguracji Bitrix24 (przekazanego w URL), albo fallback z env
+    sms_from = from_ if from_ else PLFON_FROM
 
     request_body = {
         "username": PLFON_USERNAME,
@@ -389,6 +393,7 @@ async def bitrix_native_sms(request: Request):
 
 from fastapi.responses import HTMLResponse
 
+
 @app.get("/app", response_class=HTMLResponse)
 @app.post("/app", response_class=HTMLResponse)
 async def bitrix_app(request: Request):
@@ -399,55 +404,22 @@ async def bitrix_app(request: Request):
         <meta charset="UTF-8">
         <script src="https://api.bitrix24.com/api/v1/"></script>
         <style>
-            body {
-                font-family: Arial, sans-serif;
-                padding: 20px;
-                background-color: #f9f9f9;
-                color: #333;
-            }
-            .container {
-                max-width: 600px;
-                margin: 0 auto;
-                background: white;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }
+            body { font-family: Arial, sans-serif; padding: 20px; background-color: #f9f9f9; color: #333; }
+            .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
             h2, h3 { color: #2fc6f6; }
-            .section {
-                margin-bottom: 30px;
-                padding-bottom: 20px;
-                border-bottom: 1px solid #eee;
-            }
+            .section { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
             .section:last-child { border-bottom: none; }
-            input, textarea {
-                width: 100%;
-                margin-bottom: 10px;
-                padding: 10px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                box-sizing: border-box;
-            }
-            button {
-                padding: 10px 15px;
-                border: none;
-                color: white;
-                cursor: pointer;
-                border-radius: 4px;
-                font-weight: bold;
-                margin-right: 5px;
-            }
+            input, textarea { width: 100%; margin-bottom: 10px; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+            button { padding: 10px 15px; border: none; color: white; cursor: pointer; border-radius: 4px; font-weight: bold; margin-right: 5px; margin-top: 5px;}
+            .btn-save { background: #ff9900; width: 100%; font-size: 16px; }
+            .btn-save:hover { background: #e68a00; }
             .btn-send { background: #2fc6f6; width: 100%; font-size: 16px; }
             .btn-send:hover { background: #1baedb; }
             .btn-install { background: #28a745; }
             .btn-install:hover { background: #218838; }
             .btn-remove { background: #dc3545; }
             .btn-remove:hover { background: #c82333; }
-            #status {
-                margin-top: 10px;
-                font-weight: bold;
-                text-align: center;
-            }
+            .status { margin-top: 10px; font-weight: bold; text-align: center; }
         </style>
     </head>
     <body>
@@ -455,24 +427,37 @@ async def bitrix_app(request: Request):
             <h2>📩 Panel SMSownia PlFon</h2>
 
             <div class="section">
+                <h3>⚙️ Konfiguracja Główna</h3>
+                <label>Token API (do autoryzacji z Twoim serwerem):</label>
+                <input type="password" id="config_token" placeholder="Wprowadź token API">
+
+                <label>Domyślny numer nadawcy (pole from):</label>
+                <input type="text" id="config_from" placeholder="np. 48500100200 lub Nazwa">
+
+                <button class="btn-save" onclick="saveConfig()">💾 Zapisz konfigurację</button>
+                <div id="config_status" class="status"></div>
+            </div>
+
+            <div class="section">
                 <h3>Ręczna wysyłka SMS</h3>
                 <label>Numer telefonu docelowy:</label>
                 <input id="phone" placeholder="np. 48500100200">
-                
-                <label>Numer telefonu dostawcy:</label>
+
+                <label>Numer telefonu dostawcy (możesz nadpisać):</label>
                 <input id="from" placeholder="np. 48500100200">
 
                 <label>Treść wiadomości:</label>
                 <textarea id="message" rows="4" placeholder="Wpisz treść..."></textarea>
 
                 <button class="btn-send" onclick="sendSMS()">Wyślij SMS</button>
-                <div id="status"></div>
+                <div id="send_status" class="status"></div>
             </div>
 
             <div class="section">
                 <h3>Ustawienia Integracji CRM</h3>
                 <p style="font-size: 14px; color: #666;">
-                    Zainstaluj bramkę, aby wysyłać SMSy bezpośrednio z osi czasu w karcie Leada lub Transakcji (Deala).
+                    Zainstaluj bramkę, aby wysyłać SMSy bezpośrednio z osi czasu. <br>
+                    <strong>Ważne:</strong> Przed instalacją upewnij się, że zapisałeś konfigurację powyżej!
                 </p>
                 <button class="btn-install" onclick="registerSmsProvider()">➕ Zainstaluj Bramkę SMS</button>
                 <button class="btn-remove" onclick="unregisterSmsProvider()">🗑️ Usuń Bramkę SMS</button>
@@ -481,101 +466,130 @@ async def bitrix_app(request: Request):
 
         <script>
         BX24.init(function() {
-            console.log("BX24 init OK");
+            // Pobieranie zapisanych ustawień przy starcie
+            let savedToken = BX24.appOption.get('api_token');
+            let savedFrom = BX24.appOption.get('default_from');
+
+            if(savedToken) document.getElementById("config_token").value = savedToken;
+            if(savedFrom) {
+                document.getElementById("config_from").value = savedFrom;
+                document.getElementById("from").value = savedFrom; // Automatycznie wypełnia pole w ręcznej wysyłce
+            }
 
             BX24.placement.info(function(info){
-                console.log("Placement:", info);
-
-                // Automatyczne pobranie telefonu z CRM, jeśli aplikacja jest odpalona jako zakładka
                 if(info.options && info.options.ID){
                     let entityId = info.options.ID;
                     let entityType = info.placement.includes("LEAD") ? "lead" : "deal";
 
-                    BX24.callMethod(
-                        "crm." + entityType + ".get",
-                        { id: entityId },
-                        function(result){
-                            if(result.data()){
-                                let data = result.data();
-                                if(data.PHONE && data.PHONE.length > 0){
-                                    document.getElementById("phone").value = data.PHONE[0].VALUE;
-                                }
+                    BX24.callMethod("crm." + entityType + ".get", { id: entityId }, function(result){
+                        if(result.data()){
+                            let data = result.data();
+                            if(data.PHONE && data.PHONE.length > 0){
+                                document.getElementById("phone").value = data.PHONE[0].VALUE;
                             }
                         }
-                    );
+                    });
                 }
             });
         });
 
-        // Obsługa ręcznej wysyłki z formularza
+        // Zapisywanie konfiguracji w Bitrix24
+        function saveConfig() {
+            let token = document.getElementById("config_token").value;
+            let fromNum = document.getElementById("config_from").value;
+
+            BX24.appOption.set('api_token', token);
+            BX24.appOption.set('default_from', fromNum);
+
+            document.getElementById("config_status").style.color = "green";
+            document.getElementById("config_status").innerText = "✅ Konfiguracja zapisana pomyślnie!";
+
+            // Aktualizacja pola ręcznego from
+            document.getElementById("from").value = fromNum;
+
+            setTimeout(() => { document.getElementById("config_status").innerText = ""; }, 3000);
+        }
+
+        // Obsługa ręcznej wysyłki z uwzględnieniem Tokena z konfiguracji
         function sendSMS() {
             let phone = document.getElementById("phone").value;
             let message = document.getElementById("message").value;
             let from = document.getElementById("from").value;
+            let token = BX24.appOption.get('api_token') || "";
 
             if(!phone || !message || !from) {
                 alert("Wypełnij numery i treść!");
                 return;
             }
-            
 
-            document.getElementById("status").innerText = "Wysyłanie...";
+            document.getElementById("send_status").style.color = "#333";
+            document.getElementById("send_status").innerText = "Wysyłanie...";
 
             fetch("/plfon/sendSMS", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { 
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + token // Przekazujemy token
+                },
                 body: JSON.stringify({ to: phone, text: message, from_: from })
             })
-            .then(res => res.json())
+            .then(res => {
+                if(!res.ok) throw new Error("Błąd HTTP: " + res.status);
+                return res.json();
+            })
             .then(data => {
-                document.getElementById("status").style.color = "green";
-                document.getElementById("status").innerText = "✅ Wysłano pomyślnie!";
-                document.getElementById("message").value = ""; // Czyszczenie pola
+                document.getElementById("send_status").style.color = "green";
+                document.getElementById("send_status").innerText = "✅ Wysłano pomyślnie!";
+                document.getElementById("message").value = "";
             })
             .catch(err => {
-                document.getElementById("status").style.color = "red";
-                document.getElementById("status").innerText = "❌ Błąd wysyłki";
+                document.getElementById("send_status").style.color = "red";
+                document.getElementById("send_status").innerText = "❌ Błąd wysyłki";
                 console.error(err);
             });
         }
 
-        // Instalacja natywnego dostawcy SMS
+        // Instalacja natywnego dostawcy z wstrzyknięciem konfiguracji do URLa
         function registerSmsProvider() {
+            let token = BX24.appOption.get('api_token') || "";
+            let fromNum = BX24.appOption.get('default_from') || "";
+
+            if(!token || !fromNum) {
+                alert("⚠️ Zapisz najpierw Token i domyślny numer nadawcy w konfiguracji!");
+                return;
+            }
+
+            // UWAGA: Twój adres serwera. Przekazujemy config jako parametry GET
+            let baseUrl = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
+            let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum);
+
             BX24.callMethod(
                 'messageservice.sender.add',
                 {
                     CODE: 'plfon_provider',
                     TYPE: 'SMS',
                     NAME: 'SMSownia PlFon',
-                    // UWAGA: Zmień na swój aktualny adres ngrok (z końcówką /bitrix/send-sms-native)
-                    HANDLER: 'https://unskillfully-conducible-sharita.ngrok-free.dev/bitrix/send-sms-native',
+                    HANDLER: handlerWithConfig,
                     DESCRIPTION: 'Autorski skrypt do dostarczania SMSów zintegrowany z PlFon, napisane i udoskonalane przez Marek Korkosz'
                 },
                 function(result) {
                     if(result.error()) {
                         alert("Błąd dodawania: " + result.error());
                     } else {
-                        alert("✅ Sukces! Dodano bramkę do systemu Bitrix24.");
+                        alert("✅ Sukces! Dodano bramkę. Używany nadawca: " + fromNum);
                     }
                 }
             );
         }
 
-        // Usuwanie natywnego dostawcy SMS
         function unregisterSmsProvider() {
-            BX24.callMethod(
-                'messageservice.sender.delete',
-                {
-                    CODE: 'plfon_provider'
-                },
-                function(result) {
-                    if(result.error()) {
-                        alert("Błąd usuwania: " + result.error());
-                    } else {
-                        alert("🗑️ Usunięto! SMSownia zniknęła z listy dostawców SMS.");
-                    }
+            BX24.callMethod('messageservice.sender.delete', { CODE: 'plfon_provider' }, function(result) {
+                if(result.error()) {
+                    alert("Błąd usuwania: " + result.error());
+                } else {
+                    alert("🗑️ Usunięto z listy dostawców SMS.");
                 }
-            );
+            });
         }
         </script>
     </body>
