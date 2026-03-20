@@ -2,6 +2,7 @@ import os
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from datetime import datetime
 import httpx
@@ -177,27 +178,27 @@ async def receive_sms(request: Request):
             print("⚠️ Duplikat SMS – ignoruję.")
 
         # Integracja z Bitrix24
-        # try:
-        #     bitrix_data = find_owner_by_incoming_sms(sms_from)
-        #     if bitrix_data:
-        #         owner_id = bitrix_data["OWNER_ID"]
-        #         owner_type = bitrix_data["OWNER_TYPE_ID"]
-        #         responsible = bitrix_data.get("RESPONSIBLE_ID", "1")
-        #         description = (
-        #             f"[B]SMS od:[/B] {sms_from}\n"
-        #             f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        #             f"[B]Treść:[/B]\n{sms_text}"
-        #         )
-        #         add_new_activity(owner_id, owner_type, responsible, description)
-        #         print(f"✅ Aktywność dodana do Bitrix24 (owner: {owner_id}).")
-        #     else:
-        #         print("ℹ️ Brak powiązanego Deala/Leada w Bitrix24.")
-        # except Exception as e:
-        #     import traceback
-        #     print(f"❌ Błąd integracji Bitrix24: {e}")
-        #     traceback.print_exc()
-        #
-        # return Response(content="OK", media_type="text/plain")
+        try:
+            bitrix_data = find_owner_by_incoming_sms(sms_from)
+            if bitrix_data:
+                owner_id = bitrix_data["OWNER_ID"]
+                owner_type = bitrix_data["OWNER_TYPE_ID"]
+                responsible = bitrix_data.get("RESPONSIBLE_ID", "1")
+                description = (
+                    f"[B]SMS od:[/B] {sms_from}\n"
+                    f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"[B]Treść:[/B]\n{sms_text}"
+                )
+                add_new_activity(owner_id, owner_type, responsible, description)
+                print(f"✅ Aktywność dodana do Bitrix24 (owner: {owner_id}).")
+            else:
+                print("ℹ️ Brak powiązanego Deala/Leada w Bitrix24.")
+        except Exception as e:
+            import traceback
+            print(f"❌ Błąd integracji Bitrix24: {e}")
+            traceback.print_exc()
+
+        return Response(content="OK", media_type="text/plain")
 
     except Exception as e:
         import traceback
@@ -312,6 +313,276 @@ async def send_sms(
         raise HTTPException(status_code=502, detail=f"Błąd połączenia z plfon.pl: {e}")
 
 
+from fastapi.responses import HTMLResponse
+
+#Sekcja bitrixowa
+
+@app.post("/bitrix/send-sms-native")
+async def bitrix_native_sms(request: Request):
+    """
+    Endpoint, do którego Bitrix24 wysyła żądanie, gdy użytkownik
+    skorzysta z natywnej bramki SMS w karcie Leada/Deala.
+    Bitrix wysyła dane jako formularz (application/x-www-form-urlencoded).
+    """
+    form_data = await request.form()
+
+    # Bitrix przekazuje w formularzu m.in. te pola:
+    phone = form_data.get("message_to")
+    text = form_data.get("message_body")
+    message_id = form_data.get("message_id")  # Przydatne, jeśli w przyszłości zechcesz aktualizować status dostarczenia
+
+    print(f"📥 Otrzymano żądanie wysyłki z Bitrix24: Do={phone}, Treść={text}")
+
+    if not phone or not text:
+        return Response(content="Brak wymaganych danych", status_code=400)
+
+    # Przygotowanie danych do wysyłki przez PlFon
+    sms_from = PLFON_FROM
+
+    request_body = {
+        "username": PLFON_USERNAME,
+        "password": PLFON_PASSWORD,
+        "from": sms_from,
+        "to": phone,
+        "text": text,
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    try:
+        # Wysyłka do PlFon
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            response = await http_client.post(PLFON_URL, data=request_body, headers=headers)
+            response.raise_for_status()
+
+            # Bezpieczne parsowanie odpowiedzi PlFon
+            try:
+                result = response.json()
+            except ValueError:
+                result = {"status": "ok" if response.status_code == 200 else "error"}
+
+        print(f"📤 PlFon odpowiedział: {result}")
+
+        # Zapis do MongoDB (analogicznie jak w Twojej poprzedniej funkcji)
+        if collection_outgoing is not None:
+            log_doc = {
+                "from": sms_from,
+                "to": phone,
+                "text": text,
+                "bitrix_message_id": message_id,
+                "plfon_status": result.get("status"),
+                "sent_at": datetime.utcnow(),
+            }
+            await collection_outgoing.insert_one(log_doc)
+
+        # Bitrix oczekuje odpowiedzi 200 OK, aby uznać, że serwer przyjął zadanie
+        return {"status": "success"}
+
+    except Exception as e:
+        print(f"❌ Błąd wysyłki: {e}")
+        return Response(content=str(e), status_code=500)
+
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/app", response_class=HTMLResponse)
+@app.post("/app", response_class=HTMLResponse)
+async def bitrix_app(request: Request):
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <script src="https://api.bitrix24.com/api/v1/"></script>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                padding: 20px;
+                background-color: #f9f9f9;
+                color: #333;
+            }
+            .container {
+                max-width: 600px;
+                margin: 0 auto;
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h2, h3 { color: #2fc6f6; }
+            .section {
+                margin-bottom: 30px;
+                padding-bottom: 20px;
+                border-bottom: 1px solid #eee;
+            }
+            .section:last-child { border-bottom: none; }
+            input, textarea {
+                width: 100%;
+                margin-bottom: 10px;
+                padding: 10px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                box-sizing: border-box;
+            }
+            button {
+                padding: 10px 15px;
+                border: none;
+                color: white;
+                cursor: pointer;
+                border-radius: 4px;
+                font-weight: bold;
+                margin-right: 5px;
+            }
+            .btn-send { background: #2fc6f6; width: 100%; font-size: 16px; }
+            .btn-send:hover { background: #1baedb; }
+            .btn-install { background: #28a745; }
+            .btn-install:hover { background: #218838; }
+            .btn-remove { background: #dc3545; }
+            .btn-remove:hover { background: #c82333; }
+            #status {
+                margin-top: 10px;
+                font-weight: bold;
+                text-align: center;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>📩 Panel SMSownia PlFon</h2>
+
+            <div class="section">
+                <h3>Ręczna wysyłka SMS</h3>
+                <label>Numer telefonu docelowy:</label>
+                <input id="phone" placeholder="np. 48500100200">
+                
+                <label>Numer telefonu dostawcy:</label>
+                <input id="from" placeholder="np. 48500100200">
+
+                <label>Treść wiadomości:</label>
+                <textarea id="message" rows="4" placeholder="Wpisz treść..."></textarea>
+
+                <button class="btn-send" onclick="sendSMS()">Wyślij SMS</button>
+                <div id="status"></div>
+            </div>
+
+            <div class="section">
+                <h3>Ustawienia Integracji CRM</h3>
+                <p style="font-size: 14px; color: #666;">
+                    Zainstaluj bramkę, aby wysyłać SMSy bezpośrednio z osi czasu w karcie Leada lub Transakcji (Deala).
+                </p>
+                <button class="btn-install" onclick="registerSmsProvider()">➕ Zainstaluj Bramkę SMS</button>
+                <button class="btn-remove" onclick="unregisterSmsProvider()">🗑️ Usuń Bramkę SMS</button>
+            </div>
+        </div>
+
+        <script>
+        BX24.init(function() {
+            console.log("BX24 init OK");
+
+            BX24.placement.info(function(info){
+                console.log("Placement:", info);
+
+                // Automatyczne pobranie telefonu z CRM, jeśli aplikacja jest odpalona jako zakładka
+                if(info.options && info.options.ID){
+                    let entityId = info.options.ID;
+                    let entityType = info.placement.includes("LEAD") ? "lead" : "deal";
+
+                    BX24.callMethod(
+                        "crm." + entityType + ".get",
+                        { id: entityId },
+                        function(result){
+                            if(result.data()){
+                                let data = result.data();
+                                if(data.PHONE && data.PHONE.length > 0){
+                                    document.getElementById("phone").value = data.PHONE[0].VALUE;
+                                }
+                            }
+                        }
+                    );
+                }
+            });
+        });
+
+        // Obsługa ręcznej wysyłki z formularza
+        function sendSMS() {
+            let phone = document.getElementById("phone").value;
+            let message = document.getElementById("message").value;
+            let from = document.getElementById("from").value;
+
+            if(!phone || !message || !from) {
+                alert("Wypełnij numery i treść!");
+                return;
+            }
+            
+
+            document.getElementById("status").innerText = "Wysyłanie...";
+
+            fetch("/plfon/sendSMS", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ to: phone, text: message, from_: from })
+            })
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById("status").style.color = "green";
+                document.getElementById("status").innerText = "✅ Wysłano pomyślnie!";
+                document.getElementById("message").value = ""; // Czyszczenie pola
+            })
+            .catch(err => {
+                document.getElementById("status").style.color = "red";
+                document.getElementById("status").innerText = "❌ Błąd wysyłki";
+                console.error(err);
+            });
+        }
+
+        // Instalacja natywnego dostawcy SMS
+        function registerSmsProvider() {
+            BX24.callMethod(
+                'messageservice.sender.add',
+                {
+                    CODE: 'plfon_provider',
+                    TYPE: 'SMS',
+                    NAME: 'SMSownia PlFon',
+                    // UWAGA: Zmień na swój aktualny adres ngrok (z końcówką /bitrix/send-sms-native)
+                    HANDLER: 'https://unskillfully-conducible-sharita.ngrok-free.dev/bitrix/send-sms-native',
+                    DESCRIPTION: 'Autorski skrypt do dostarczania SMSów zintegrowany z PlFon, napisane i udoskonalane przez Marek Korkosz'
+                },
+                function(result) {
+                    if(result.error()) {
+                        alert("Błąd dodawania: " + result.error());
+                    } else {
+                        alert("✅ Sukces! Dodano bramkę do systemu Bitrix24.");
+                    }
+                }
+            );
+        }
+
+        // Usuwanie natywnego dostawcy SMS
+        function unregisterSmsProvider() {
+            BX24.callMethod(
+                'messageservice.sender.delete',
+                {
+                    CODE: 'plfon_provider'
+                },
+                function(result) {
+                    if(result.error()) {
+                        alert("Błąd usuwania: " + result.error());
+                    } else {
+                        alert("🗑️ Usunięto! SMSownia zniknęła z listy dostawców SMS.");
+                    }
+                }
+            );
+        }
+        </script>
+    </body>
+    </html>
+    """
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="localhost", port=port)
