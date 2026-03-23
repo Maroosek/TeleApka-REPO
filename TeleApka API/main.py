@@ -121,9 +121,10 @@ async def receive_sms(request: Request):
     try:
         # Wyciąganie danych w zależności od metody HTTP
         if request.method == "GET":
-            sms_from = request.query_params.get("from")
-            sms_to = request.query_params.get("to")
-            sms_text = request.query_params.get("text")
+            # Pobieranie 'sms_from' z fallbackiem na 'from'
+            sms_from = request.query_params.get("sms_from") or request.query_params.get("from")
+            sms_to = request.query_params.get("sms_to") or request.query_params.get("to")
+            sms_text = request.query_params.get("sms_text") or request.query_params.get("text")
             receive_date_raw = request.query_params.get("receive_date")
         else:
             content_type = request.headers.get("content-type", "")
@@ -131,22 +132,23 @@ async def receive_sms(request: Request):
             # Obsługa POST: form-data lub JSON
             if "application/json" in content_type:
                 data_raw = await request.json()
-                sms_from = data_raw.get("from")
-                sms_to = data_raw.get("to")
-                sms_text = data_raw.get("text")
+                sms_from = data_raw.get("sms_from") or data_raw.get("from")
+                sms_to = data_raw.get("sms_to") or data_raw.get("to")
+                sms_text = data_raw.get("sms_text") or data_raw.get("text")
                 receive_date_raw = data_raw.get("receive_date")
             else:
                 body_bytes = await request.body()
                 body_str = body_bytes.decode("utf-8")
                 data = parse_qs(body_str)
 
-                def get_val(key):
-                    return data.get(key, [None])[0]
+                def get_val(key, alt_key):
+                    # Zwraca wartość dla klucza głównego, jeśli brak, szuka alternatywnego
+                    return data.get(key, data.get(alt_key, [None]))[0]
 
-                sms_from = get_val("from")
-                sms_to = get_val("to")
-                sms_text = get_val("text")
-                receive_date_raw = get_val("receive_date")
+                sms_from = get_val("sms_from", "from")
+                sms_to = get_val("sms_to", "to")
+                sms_text = get_val("sms_text", "text")
+                receive_date_raw = data.get("receive_date", [None])[0]
 
         # Walidacja wymaganych pól
         if not sms_from or not sms_text:
