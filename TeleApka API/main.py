@@ -415,18 +415,21 @@ async def bitrix_app(request: Request):
             .btn-save:hover { background: #e68a00; }
             .btn-send { background: #2fc6f6; width: 100%; font-size: 16px; }
             .btn-send:hover { background: #1baedb; }
-            .btn-install { background: #28a745; }
+            .btn-install { background: #28a745; width: 100%; font-size: 16px; margin-bottom: 10px; }
             .btn-install:hover { background: #218838; }
             .btn-remove { background: #dc3545; }
             .btn-remove:hover { background: #c82333; }
             .status { margin-top: 10px; font-weight: bold; text-align: center; }
+            .provider-list { background: #f1f1f1; padding: 15px; border-radius: 4px; min-height: 50px; margin-top: 10px; }
+            .provider-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #ddd; }
+            .provider-item:last-child { border-bottom: none; }
         </style>
     </head>
     <body>
         <div class="container">
             <h2>📩 Panel SMSownia PlFon</h2>
 
-            <div class="section">
+            <div class="section" id="config_section">
                 <h3>⚙️ Konfiguracja Główna</h3>
                 <label>Token API (do autoryzacji z Twoim serwerem):</label>
                 <input type="password" id="config_token" placeholder="Wprowadź token API">
@@ -438,7 +441,7 @@ async def bitrix_app(request: Request):
                 <div id="config_status" class="status"></div>
             </div>
 
-            <div class="section">
+            <div class="section" id="manual_sms_section">
                 <h3>Ręczna wysyłka SMS</h3>
                 <label>Numer telefonu docelowy:</label>
                 <input id="phone" placeholder="np. 48500100200">
@@ -453,31 +456,117 @@ async def bitrix_app(request: Request):
                 <div id="send_status" class="status"></div>
             </div>
 
-            <div class="section">
-                <h3>Ustawienia Integracji CRM</h3>
+            <div class="section" id="manager_section">
+                <h3>📱 Menedżer Nadawców (Oś czasu CRM)</h3>
                 <p style="font-size: 14px; color: #666;">
-                    Zainstaluj bramkę, aby wysyłać SMSy bezpośrednio z osi czasu. <br>
-                    <strong>Ważne:</strong> Przed instalacją upewnij się, że zapisałeś konfigurację powyżej!
+                    Dodawaj wielu nadawców. Będą oni widoczni jako opcje wyboru w standardowym oknie SMS w Bitrix24.
                 </p>
-                <button class="btn-install" onclick="registerSmsProvider()">➕ Zainstaluj Bramkę SMS</button>
-                <button class="btn-remove" onclick="unregisterSmsProvider()">🗑️ Usuń Bramkę SMS</button>
+
+                <label>Nazwa wyświetlana w Bitrix (np. PlFon - Biuro):</label>
+                <input type="text" id="new_provider_name" placeholder="Wpisz nazwę">
+
+                <label>Numer nadawcy (pole 'from'):</label>
+                <input type="text" id="new_provider_from" placeholder="np. 48500100200">
+
+                <button class="btn-install" onclick="addDynamicProvider()">➕ Dodaj Nadawcę</button>
+
+                <h4>Zainstalowani nadawcy:</h4>
+                <div id="provider_list" class="provider-list">
+                    Ładowanie listy...
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3>⚙️ Instalacja Bramki SMS</h3>
+                <p style="font-size: 14px; color: #666;">
+                    Instaluje bramkę <strong>SMSownia PlFon</strong> jako stałego dostawcę SMS w Bitrix24.<br>
+                    <strong>Ważne:</strong> Przed instalacją zapisz Token i numer nadawcy w konfiguracji powyżej!
+                </p>
+                <button class="btn-install" style="width:100%; font-size:16px; margin-bottom:10px;" onclick="registerSmsProvider()">➕ Zainstaluj Bramkę SMS</button>
+                <button class="btn-remove" style="width:100%; font-size:16px;" onclick="unregisterSmsProvider()">🗑️ Usuń Bramkę SMS</button>
+                <div id="install_status" class="status"></div>
             </div>
         </div>
 
         <script>
         BX24.init(function() {
-            // Pobieranie zapisanych ustawień przy starcie
+            // 1. Pobieranie zapisanych ustawień przy starcie
             let savedToken = BX24.appOption.get('api_token');
             let savedFrom = BX24.appOption.get('default_from');
 
             if(savedToken) document.getElementById("config_token").value = savedToken;
             if(savedFrom) {
                 document.getElementById("config_from").value = savedFrom;
-                document.getElementById("from").value = savedFrom; // Automatycznie wypełnia pole w ręcznej wysyłce
+                document.getElementById("from").value = savedFrom;
+            }
+            
+            function registerSmsProvider() {
+                let token = BX24.appOption.get('api_token') || "";
+                let fromNum = BX24.appOption.get('default_from') || "";
+            
+                if(!token || !fromNum) {
+                    alert("⚠️ Zapisz najpierw Token i domyślny numer nadawcy w konfiguracji!");
+                    return;
+                }
+            
+                let baseUrl = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
+                let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum) + "&label=" + encodeURIComponent("SMSownia PlFon");
+            
+                document.getElementById("install_status").style.color = "#333";
+                document.getElementById("install_status").innerText = "Instalowanie...";
+            
+                BX24.callMethod(
+                    'messageservice.sender.add',
+                    {
+                        CODE: 'plfon_provider',
+                        TYPE: 'SMS',
+                        NAME: 'SMSownia PlFon',
+                        HANDLER: handlerWithConfig,
+                        DESCRIPTION: 'Autorski skrypt do dostarczania SMSów zintegrowany z PlFon'
+                    },
+                    function(result) {
+                        if(result.error()) {
+                            document.getElementById("install_status").style.color = "red";
+                            document.getElementById("install_status").innerText = "❌ Błąd: " + result.error();
+                        } else {
+                            saveProviderName('plfon_provider', 'SMSownia PlFon');
+                            document.getElementById("install_status").style.color = "green";
+                            document.getElementById("install_status").innerText = "✅ Bramka zainstalowana! Nadawca: " + fromNum;
+                            setTimeout(loadProviders, 1000);
+                        }
+                    }
+                );
+            }
+            
+            function unregisterSmsProvider() {
+                if(!confirm("Czy na pewno chcesz usunąć bramkę SMSownia PlFon?")) return;
+            
+                document.getElementById("install_status").style.color = "#333";
+                document.getElementById("install_status").innerText = "Usuwanie...";
+            
+                BX24.callMethod('messageservice.sender.delete', { CODE: 'plfon_provider' }, function(result) {
+                    if(result.error()) {
+                        document.getElementById("install_status").style.color = "red";
+                        document.getElementById("install_status").innerText = "❌ Błąd: " + result.error();
+                    } else {
+                        removeProviderName('plfon_provider');
+                        document.getElementById("install_status").style.color = "green";
+                        document.getElementById("install_status").innerText = "🗑️ Bramka usunięta.";
+                        setTimeout(loadProviders, 1000);
+                    }
+                });
             }
 
+            // 2. Ładowanie listy dostawców
+            loadProviders();
+
+            // 3. Sprawdzanie osadzenia (dla opcji z zakładką w Leadzie)
             BX24.placement.info(function(info){
                 if(info.options && info.options.ID){
+                    // Ukrywamy sekcje konfiguracyjne, jeśli to widok wewnątrz Leada
+                    document.getElementById("config_section").style.display = "none";
+                    document.getElementById("manager_section").style.display = "none";
+
                     let entityId = info.options.ID;
                     let entityType = info.placement.includes("LEAD") ? "lead" : "deal";
 
@@ -493,7 +582,6 @@ async def bitrix_app(request: Request):
             });
         });
 
-        // Zapisywanie konfiguracji w Bitrix24
         function saveConfig() {
             let token = document.getElementById("config_token").value;
             let fromNum = document.getElementById("config_from").value;
@@ -503,14 +591,11 @@ async def bitrix_app(request: Request):
 
             document.getElementById("config_status").style.color = "green";
             document.getElementById("config_status").innerText = "✅ Konfiguracja zapisana pomyślnie!";
-
-            // Aktualizacja pola ręcznego from
             document.getElementById("from").value = fromNum;
 
             setTimeout(() => { document.getElementById("config_status").innerText = ""; }, 3000);
         }
 
-        // Obsługa ręcznej wysyłki z uwzględnieniem Tokena z konfiguracji
         function sendSMS() {
             let phone = document.getElementById("phone").value;
             let message = document.getElementById("message").value;
@@ -529,7 +614,7 @@ async def bitrix_app(request: Request):
                 method: "POST",
                 headers: { 
                     "Content-Type": "application/json",
-                    "Authorization": "Bearer " + token // Przekazujemy token
+                    "Authorization": "Bearer " + token
                 },
                 body: JSON.stringify({ to: phone, text: message, from_: from })
             })
@@ -549,47 +634,136 @@ async def bitrix_app(request: Request):
             });
         }
 
-        // Instalacja natywnego dostawcy z wstrzyknięciem konfiguracji do URLa
-        function registerSmsProvider() {
-            let token = BX24.appOption.get('api_token') || "";
-            let fromNum = BX24.appOption.get('default_from') || "";
+        // --- ZARZĄDZANIE NADAWCAMI (OŚ CZASU) ---
 
-            if(!token || !fromNum) {
-                alert("⚠️ Zapisz najpierw Token i domyślny numer nadawcy w konfiguracji!");
+        // Funkcje pomocnicze do pamięci podręcznej (Local Storage w Bitrix)
+        function getSavedProviders() {
+            let saved = BX24.appOption.get('plfon_saved_providers');
+            if (!saved) return {};
+            try { return JSON.parse(saved); } catch(e) { return {}; }
+        }
+
+        function saveProviderName(code, name) {
+            let saved = getSavedProviders();
+            saved[code] = name;
+            BX24.appOption.set('plfon_saved_providers', JSON.stringify(saved));
+        }
+
+        function removeProviderName(code) {
+            let saved = getSavedProviders();
+            delete saved[code];
+            BX24.appOption.set('plfon_saved_providers', JSON.stringify(saved));
+        }
+
+        // Główne funkcje
+        function loadProviders() {
+            BX24.callMethod('messageservice.sender.list', {}, function(result) {
+                if(result.error()) {
+                    document.getElementById('provider_list').innerHTML = "<span style='color:red;'>Błąd: " + result.error() + "</span>";
+                    return;
+                }
+        
+                let providers = result.data() || [];
+                console.log("RAW sender.list:", JSON.stringify(providers));
+        
+                let ourProviders = providers.filter(p => {
+                    let code = typeof p === 'object' ? p.CODE : p;
+                    return code && code.startsWith('plfon_');
+                });
+        
+                if(ourProviders.length === 0) {
+                    document.getElementById('provider_list').innerHTML = 'Brak skonfigurowanych nadawców.';
+                    return;
+                }
+        
+                let html = '';
+                ourProviders.forEach(p => {
+                    let code    = typeof p === 'object' ? (p.CODE || '') : p;
+                    let handler = typeof p === 'object' ? (p.HANDLER || '') : '';
+        
+                    // Wyciągnij nazwę z parametru ?label= w HANDLER
+                    let name = '';
+                    try {
+                        let url = new URL(handler);
+                        name = url.searchParams.get('label') || '';
+                    } catch(e) {}
+        
+                    // Fallback do appOption
+                    if(!name) {
+                        let savedNames = getSavedProviders();
+                        name = savedNames[code] || code;
+                    }
+        
+                    html += `<div class="provider-item">
+                                <div>
+                                    <strong>${name}</strong><br>
+                                    <small style="color: #666;">Kod techniczny: ${code}</small>
+                                </div>
+                                <button class="btn-remove" onclick="deleteDynamicProvider('${code}')">Usuń</button>
+                             </div>`;
+                });
+                document.getElementById('provider_list').innerHTML = html;
+            });
+        }
+
+        function addDynamicProvider() {
+            let name = document.getElementById("new_provider_name").value;
+            let fromNum = document.getElementById("new_provider_from").value;
+            let token = BX24.appOption.get('api_token') || "";
+
+            if(!name || !fromNum) {
+                alert("Wypełnij nazwę i numer nadawcy!");
+                return;
+            }
+            if(!token) {
+                alert("Najpierw wpisz i zapisz Token API w Konfiguracji Głównej!");
                 return;
             }
 
-            // UWAGA: Twój adres serwera. Przekazujemy config jako parametry GET
+            let uniqueCode = 'plfon_' + Date.now();
             let baseUrl = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
-            let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum);
+            let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum) + "&label=" + encodeURIComponent(name);
+
+            document.getElementById('provider_list').innerHTML = "Trwa dodawanie do Bitrix24...";
 
             BX24.callMethod(
                 'messageservice.sender.add',
                 {
-                    CODE: 'plfon_provider',
+                    CODE: uniqueCode,
                     TYPE: 'SMS',
-                    NAME: 'SMSownia PlFon',
+                    NAME: name,
                     HANDLER: handlerWithConfig,
-                    DESCRIPTION: 'Autorski skrypt do dostarczania SMSów zintegrowany z PlFon, napisane i udoskonalane przez Marek Korkosz'
+                    DESCRIPTION: 'Nadawca SMS: ' + fromNum
                 },
                 function(result) {
                     if(result.error()) {
                         alert("Błąd dodawania: " + result.error());
+                        loadProviders();
                     } else {
-                        alert("✅ Sukces! Dodano bramkę. Używany nadawca: " + fromNum);
+                        // Sukces: Zapisujemy ładną nazwę do pamięci i czyścimy formularz
+                        saveProviderName(uniqueCode, name);
+                        document.getElementById("new_provider_name").value = "";
+                        document.getElementById("new_provider_from").value = "";
+                        setTimeout(loadProviders, 1000); 
                     }
                 }
             );
         }
 
-        function unregisterSmsProvider() {
-            BX24.callMethod('messageservice.sender.delete', { CODE: 'plfon_provider' }, function(result) {
-                if(result.error()) {
-                    alert("Błąd usuwania: " + result.error());
-                } else {
-                    alert("🗑️ Usunięto z listy dostawców SMS.");
-                }
-            });
+        function deleteDynamicProvider(code) {
+            if(confirm("Czy na pewno chcesz bezpowrotnie usunąć tego nadawcę?")) {
+                document.getElementById('provider_list').innerHTML = "Usuwanie...";
+                
+                BX24.callMethod('messageservice.sender.delete', { CODE: code }, function(result) {
+                    if(result.error()) {
+                        alert("Błąd usuwania: " + result.error());
+                    } else {
+                        // Usuwamy nazwę również z naszej pamięci
+                        removeProviderName(code);
+                    }
+                    setTimeout(loadProviders, 1000);
+                });
+            }
         }
         </script>
     </body>
