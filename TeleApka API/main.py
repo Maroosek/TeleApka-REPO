@@ -5,6 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+WARSAW = ZoneInfo("Europe/Warsaw")
 import httpx
 from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,6 +20,7 @@ from Bitrix24 import find_owner_by_incoming_sms, add_new_activity
 # Konfiguracja
 try:
     from config import MongoCredentials, Config_PlFon, Config_Auth
+
     mongo_url = MongoCredentials.MONGODB_URL
     db_name = MongoCredentials.DATABASE_NAME
     collection_SMS = MongoCredentials.COLLECTION_SMS
@@ -39,6 +43,7 @@ port = int(os.getenv("PORT", 8020))
 # Zmienne globalne na kolekcje
 collection_incoming: Optional[object] = None
 collection_outgoing: Optional[object] = None
+
 
 # --- LIFESPAN ---
 @asynccontextmanager
@@ -79,6 +84,7 @@ app.add_middleware(
 
 security = HTTPBearer()
 
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
     Sprawdza, czy token Bearer przekazany w nagłówku Authorization
@@ -92,18 +98,21 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
     return credentials.credentials
 
+
 # --- MODELE ---
 
 class SendSMSRequest(BaseModel):
-    to: str          # numer(y) B w formacie e164, np. "48510123123" lub kilka po przecinku
-    text: str        # treść SMS (max 918 znaków bez polskich znaków / 402 ze znakami specjalnymi)
+    to: str  # numer(y) B w formacie e164, np. "48510123123" lub kilka po przecinku
+    text: str  # treść SMS (max 918 znaków bez polskich znaków / 402 ze znakami specjalnymi)
     from_: Optional[str] = None  # opcjonalne nadpisanie nadawcy
+
 
 # --- ENDPOINTY ---
 
 @app.get("/")
 async def root():
     return {"message": "API SMSowni 2.0", "docs": "/docs"}
+
 
 # -----------------------------------------------------------------------
 # Odbieranie SMS-ów przychodzących od plfon.pl
@@ -121,7 +130,6 @@ async def receive_sms(request: Request):
     try:
         # Wyciąganie danych w zależności od metody HTTP
         if request.method == "GET":
-            # Pobieranie 'sms_from' z fallbackiem na 'from'
             sms_from = request.query_params.get("sms_from") or request.query_params.get("from")
             sms_to = request.query_params.get("sms_to") or request.query_params.get("to")
             sms_text = request.query_params.get("sms_text") or request.query_params.get("text")
@@ -129,7 +137,6 @@ async def receive_sms(request: Request):
         else:
             content_type = request.headers.get("content-type", "")
 
-            # Obsługa POST: form-data lub JSON
             if "application/json" in content_type:
                 data_raw = await request.json()
                 sms_from = data_raw.get("sms_from") or data_raw.get("from")
@@ -142,7 +149,6 @@ async def receive_sms(request: Request):
                 data = parse_qs(body_str)
 
                 def get_val(key, alt_key):
-                    # Zwraca wartość dla klucza głównego, jeśli brak, szuka alternatywnego
                     return data.get(key, data.get(alt_key, [None]))[0]
 
                 sms_from = get_val("sms_from", "from")
@@ -156,21 +162,95 @@ async def receive_sms(request: Request):
             return Response(content="OK", media_type="text/plain")
 
         # Konwersja unix timestamp → datetime
+        # Konwertuj z UTC na czas warszawski; strip tzinfo przed zapisem do Mongo
         receive_date = (
-            datetime.fromtimestamp(int(receive_date_raw))
+            datetime.fromtimestamp(int(receive_date_raw), tz=WARSAW).replace(tzinfo=None)
             if receive_date_raw
-            else datetime.utcnow()
+            else datetime.now(tz=WARSAW).replace(tzinfo=None)
         )
 
         print(f"📨 SMS od {sms_from} → {sms_to}: {sms_text[:50]}...")
 
-        # Zapis do MongoDB
+        # ---------------------------------------------------------------
+        # Blok Bitrix24 – zbieramy pełne dane do logu PRZED zapisem do bazy
+        # ---------------------------------------------------------------
+        bitrix_log: dict = {
+            "status": None,  # "ok" | "no_contact" | "activity_failed" | "error"
+            "contact_ids": [],  # lista ID kontaktów znalezionych po numerze
+            "owner_id": None,  # ID Deala lub Leada
+            "owner_type_id": None,  # "1" = Lead, "2" = Deal
+            "owner_type_label": None,  # czytelna etykieta
+            "responsible_id": None,  # ID opiekuna
+            "activity_id": None,  # ID dodanej aktywności w Bitrix
+            "error": None,  # komunikat błędu (jeśli wystąpił)
+        }
+
+        try:
+            bitrix_data = find_owner_by_incoming_sms(sms_from)
+
+            if bitrix_data is None:
+                bitrix_log["status"] = "no_contact"
+                print("ℹ️ Brak powiązanego kontaktu/Deala/Leada w Bitrix24.")
+            else:
+                owner_id = bitrix_data["OWNER_ID"]
+                owner_type_id = bitrix_data["OWNER_TYPE_ID"]
+                responsible = bitrix_data.get("RESPONSIBLE_ID", "1")
+                type_label = "Lead" if owner_type_id == "1" else "Deal"
+
+                bitrix_log["owner_id"] = owner_id
+                bitrix_log["owner_type_id"] = owner_type_id
+                bitrix_log["owner_type_label"] = type_label
+                bitrix_log["responsible_id"] = responsible
+
+                description = (
+                    f"[B]SMS od:[/B] {sms_from}\n"
+                    f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"[B]Treść:[/B]\n{sms_text}"
+                )
+                activity_id = add_new_activity(owner_id, owner_type_id, responsible, description)
+
+                if activity_id:
+                    bitrix_log["status"] = "ok"
+                    bitrix_log["activity_id"] = str(activity_id)
+                    print(f"✅ Aktywność dodana do Bitrix24 ({type_label} ID={owner_id}), activity_id={activity_id}.")
+                else:
+                    bitrix_log["status"] = "activity_failed"
+                    bitrix_log["error"] = "add_new_activity zwróciło None"
+                    print(f"⚠️ Właściciel znaleziony ({type_label} ID={owner_id}), ale nie udało się dodać aktywności.")
+
+        except Exception as e:
+            import traceback
+            bitrix_log["status"] = "error"
+            bitrix_log["error"] = str(e)
+            print(f"❌ Błąd integracji Bitrix24: {e}")
+            traceback.print_exc()
+
+        # ---------------------------------------------------------------
+        # Zapis do MongoDB – jeden dokument z pełnym kontekstem
+        # ---------------------------------------------------------------
         sms_doc = {
+            # --- dane SMS ---
             "from": sms_from,
             "to": sms_to,
             "text": sms_text,
             "receive_date": receive_date,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(tz=WARSAW).replace(tzinfo=None),
+
+            # --- wyniki wyszukiwania w Bitrix24 ---
+            "bitrix": {
+                "status": bitrix_log["status"],
+                # "no_contact"      – numer nieznany w CRM / brak Leadów ani Deali
+                # "ok"              – aktywność dodana pomyślnie
+                # "activity_failed" – właściciel znaleziony, błąd zapisu aktywności
+                # "error"           – wyjątek podczas integracji
+                "contact_ids": bitrix_log["contact_ids"],
+                "owner_id": bitrix_log["owner_id"],
+                "owner_type_id": bitrix_log["owner_type_id"],
+                "owner_type_label": bitrix_log["owner_type_label"],
+                "responsible_id": bitrix_log["responsible_id"],
+                "activity_id": bitrix_log["activity_id"],
+                "error": bitrix_log["error"],
+            },
         }
 
         try:
@@ -178,27 +258,6 @@ async def receive_sms(request: Request):
             print("✅ SMS zapisany w bazie.")
         except DuplicateKeyError:
             print("⚠️ Duplikat SMS – ignoruję.")
-
-        # Integracja z Bitrix24
-        try:
-            bitrix_data = find_owner_by_incoming_sms(sms_from)
-            if bitrix_data:
-                owner_id = bitrix_data["OWNER_ID"]
-                owner_type = bitrix_data["OWNER_TYPE_ID"]
-                responsible = bitrix_data.get("RESPONSIBLE_ID", "1")
-                description = (
-                    f"[B]SMS od:[/B] {sms_from}\n"
-                    f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"[B]Treść:[/B]\n{sms_text}"
-                )
-                add_new_activity(owner_id, owner_type, responsible, description)
-                print(f"✅ Aktywność dodana do Bitrix24 (owner: {owner_id}).")
-            else:
-                print("ℹ️ Brak powiązanego Deala/Leada w Bitrix24.")
-        except Exception as e:
-            import traceback
-            print(f"❌ Błąd integracji Bitrix24: {e}")
-            traceback.print_exc()
 
         return Response(content="OK", media_type="text/plain")
 
@@ -208,13 +267,14 @@ async def receive_sms(request: Request):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # -----------------------------------------------------------------------
 # Wysyłanie SMS-ów przez plfon.pl
 # -----------------------------------------------------------------------
 @app.post("/plfon/sendSMS")
 async def send_sms(
-    payload: SendSMSRequest,
-    token: str = Depends(verify_token)  # Zabezpieczenie Bearer Tokenem
+        payload: SendSMSRequest,
+        token: str = Depends(verify_token)
 ):
     """
     Wysyła SMS przez API plfon.pl.
@@ -228,7 +288,6 @@ async def send_sms(
     if not PLFON_USERNAME or not PLFON_PASSWORD:
         raise HTTPException(status_code=500, detail="Brak konfiguracji danych logowania plfon.pl")
 
-    # Walidacja liczby odbiorców (max 10 wg dokumentacji)
     recipients = [r.strip() for r in payload.to.split(",") if r.strip()]
     if len(recipients) > 10:
         raise HTTPException(
@@ -236,7 +295,6 @@ async def send_sms(
             detail=f"Zbyt wielu odbiorców ({len(recipients)}). Maksimum to 10 na jedno wywołanie."
         )
 
-    # Walidacja długości tekstu
     if len(payload.text) > 918:
         raise HTTPException(
             status_code=400,
@@ -253,7 +311,6 @@ async def send_sms(
         "text": payload.text,
     }
 
-    # Wymuszenie formatu x-www-form-urlencoded i fałszywy User-Agent, aby obejść 406 Not Acceptable
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "*/*",
@@ -269,12 +326,10 @@ async def send_sms(
 
             response.raise_for_status()
 
-            # Bezpieczne parsowanie odpowiedzi
             try:
                 result = response.json()
             except ValueError:
                 print(f"⚠️ Odpowiedź Plfon nie jest JSON-em: {response.text}")
-                # Fallback, aby aplikacja się nie zawiesiła przy sprawdzaniu 'error_code' i zapisie do bazy
                 result = {
                     "status": "ok" if response.status_code == 200 else "error",
                     "error_code": "0" if response.status_code == 200 else str(response.status_code),
@@ -283,7 +338,6 @@ async def send_sms(
 
         print(f"📤 Odpowiedź plfon.pl: {result}")
 
-        # Zapis wyniku do MongoDB
         log_doc = {
             "from": sms_from,
             "to": payload.to,
@@ -292,11 +346,10 @@ async def send_sms(
             "plfon_status": result.get("status"),
             "plfon_error_code": result.get("error_code"),
             "plfon_error_message": result.get("error_message"),
-            "sent_at": datetime.utcnow(),
+            "sent_at": datetime.now(tz=WARSAW).replace(tzinfo=None),
         }
         await collection_outgoing.insert_one(log_doc)
 
-        # Sprawdzenie czy plfon zwrócił błąd w swoim API
         error_code = result.get("error_code")
         if error_code not in ("0", 0, None):
             raise HTTPException(
@@ -317,18 +370,18 @@ async def send_sms(
 
 from fastapi.responses import HTMLResponse
 
-#Sekcja bitrixowa
+
+# Sekcja bitrixowa
 
 @app.post("/bitrix/send-sms-native")
 async def bitrix_native_sms(
-    request: Request,
-    token: Optional[str] = None, # Pobierane z URL-a: ?token=...
-    from_: Optional[str] = None  # Pobierane z URL-a: ?from_=...
+        request: Request,
+        token: Optional[str] = None,
+        from_: Optional[str] = None
 ):
     """
     Endpoint wywoływany przez Bitrix24 z natywnej bramki.
     """
-    # 1. Weryfikacja tokena przekazanego w URL podczas instalacji bramki
     if token != API_AUTH_TOKEN:
         return Response(content="Nieautoryzowany dostęp (zły token)", status_code=401)
 
@@ -342,7 +395,6 @@ async def bitrix_native_sms(
     if not phone or not text:
         return Response(content="Brak wymaganych danych", status_code=400)
 
-    # Używamy nadawcy z konfiguracji Bitrix24 (przekazanego w URL), albo fallback z env
     sms_from = from_ if from_ else PLFON_FROM
 
     request_body = {
@@ -360,12 +412,10 @@ async def bitrix_native_sms(
     }
 
     try:
-        # Wysyłka do PlFon
         async with httpx.AsyncClient(timeout=15.0) as http_client:
             response = await http_client.post(PLFON_URL, data=request_body, headers=headers)
             response.raise_for_status()
 
-            # Bezpieczne parsowanie odpowiedzi PlFon
             try:
                 result = response.json()
             except ValueError:
@@ -373,7 +423,6 @@ async def bitrix_native_sms(
 
         print(f"📤 PlFon odpowiedział: {result}")
 
-        # Zapis do MongoDB (analogicznie jak w Twojej poprzedniej funkcji)
         if collection_outgoing is not None:
             log_doc = {
                 "from": sms_from,
@@ -381,11 +430,10 @@ async def bitrix_native_sms(
                 "text": text,
                 "bitrix_message_id": message_id,
                 "plfon_status": result.get("status"),
-                "sent_at": datetime.utcnow(),
+                "sent_at": datetime.now(tz=WARSAW).replace(tzinfo=None),
             }
             await collection_outgoing.insert_one(log_doc)
 
-        # Bitrix oczekuje odpowiedzi 200 OK, aby uznać, że serwer przyjął zadanie
         return {"status": "success"}
 
     except Exception as e:
@@ -477,7 +525,7 @@ async def bitrix_app(request: Request):
                     Ładowanie listy...
                 </div>
             </div>
-            
+
             <div class="section">
                 <h3>⚙️ Instalacja Bramki SMS</h3>
                 <p style="font-size: 14px; color: #666;">
@@ -492,31 +540,30 @@ async def bitrix_app(request: Request):
 
         <script>
         BX24.init(function() {
-            // 1. Pobieranie zapisanych ustawień przy starcie
             let savedToken = BX24.appOption.get('api_token');
-            let savedFrom = BX24.appOption.get('default_from');
+            let savedFrom  = BX24.appOption.get('default_from');
 
             if(savedToken) document.getElementById("config_token").value = savedToken;
             if(savedFrom) {
                 document.getElementById("config_from").value = savedFrom;
                 document.getElementById("from").value = savedFrom;
             }
-            
+
             function registerSmsProvider() {
-                let token = BX24.appOption.get('api_token') || "";
+                let token   = BX24.appOption.get('api_token') || "";
                 let fromNum = BX24.appOption.get('default_from') || "";
-            
+
                 if(!token || !fromNum) {
                     alert("⚠️ Zapisz najpierw Token i domyślny numer nadawcy w konfiguracji!");
                     return;
                 }
-            
+
                 let baseUrl = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
                 let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum) + "&label=" + encodeURIComponent("SMSownia PlFon");
-            
+
                 document.getElementById("install_status").style.color = "#333";
                 document.getElementById("install_status").innerText = "Instalowanie...";
-            
+
                 BX24.callMethod(
                     'messageservice.sender.add',
                     {
@@ -539,13 +586,13 @@ async def bitrix_app(request: Request):
                     }
                 );
             }
-            
+
             function unregisterSmsProvider() {
                 if(!confirm("Czy na pewno chcesz usunąć bramkę SMSownia PlFon?")) return;
-            
+
                 document.getElementById("install_status").style.color = "#333";
                 document.getElementById("install_status").innerText = "Usuwanie...";
-            
+
                 BX24.callMethod('messageservice.sender.delete', { CODE: 'plfon_provider' }, function(result) {
                     if(result.error()) {
                         document.getElementById("install_status").style.color = "red";
@@ -559,17 +606,14 @@ async def bitrix_app(request: Request):
                 });
             }
 
-            // 2. Ładowanie listy dostawców
             loadProviders();
 
-            // 3. Sprawdzanie osadzenia (dla opcji z zakładką w Leadzie)
             BX24.placement.info(function(info){
                 if(info.options && info.options.ID){
-                    // Ukrywamy sekcje konfiguracyjne, jeśli to widok wewnątrz Leada
                     document.getElementById("config_section").style.display = "none";
                     document.getElementById("manager_section").style.display = "none";
 
-                    let entityId = info.options.ID;
+                    let entityId   = info.options.ID;
                     let entityType = info.placement.includes("LEAD") ? "lead" : "deal";
 
                     BX24.callMethod("crm." + entityType + ".get", { id: entityId }, function(result){
@@ -585,7 +629,7 @@ async def bitrix_app(request: Request):
         });
 
         function saveConfig() {
-            let token = document.getElementById("config_token").value;
+            let token   = document.getElementById("config_token").value;
             let fromNum = document.getElementById("config_from").value;
 
             BX24.appOption.set('api_token', token);
@@ -599,10 +643,10 @@ async def bitrix_app(request: Request):
         }
 
         function sendSMS() {
-            let phone = document.getElementById("phone").value;
+            let phone   = document.getElementById("phone").value;
             let message = document.getElementById("message").value;
-            let from = document.getElementById("from").value;
-            let token = BX24.appOption.get('api_token') || "";
+            let from    = document.getElementById("from").value;
+            let token   = BX24.appOption.get('api_token') || "";
 
             if(!phone || !message || !from) {
                 alert("Wypełnij numery i treść!");
@@ -636,9 +680,6 @@ async def bitrix_app(request: Request):
             });
         }
 
-        // --- ZARZĄDZANIE NADAWCAMI (OŚ CZASU) ---
-
-        // Funkcje pomocnicze do pamięci podręcznej (Local Storage w Bitrix)
         function getSavedProviders() {
             let saved = BX24.appOption.get('plfon_saved_providers');
             if (!saved) return {};
@@ -657,45 +698,42 @@ async def bitrix_app(request: Request):
             BX24.appOption.set('plfon_saved_providers', JSON.stringify(saved));
         }
 
-        // Główne funkcje
         function loadProviders() {
             BX24.callMethod('messageservice.sender.list', {}, function(result) {
                 if(result.error()) {
                     document.getElementById('provider_list').innerHTML = "<span style='color:red;'>Błąd: " + result.error() + "</span>";
                     return;
                 }
-        
+
                 let providers = result.data() || [];
                 console.log("RAW sender.list:", JSON.stringify(providers));
-        
+
                 let ourProviders = providers.filter(p => {
                     let code = typeof p === 'object' ? p.CODE : p;
                     return code && code.startsWith('plfon_');
                 });
-        
+
                 if(ourProviders.length === 0) {
                     document.getElementById('provider_list').innerHTML = 'Brak skonfigurowanych nadawców.';
                     return;
                 }
-        
+
                 let html = '';
                 ourProviders.forEach(p => {
                     let code    = typeof p === 'object' ? (p.CODE || '') : p;
                     let handler = typeof p === 'object' ? (p.HANDLER || '') : '';
-        
-                    // Wyciągnij nazwę z parametru ?label= w HANDLER
+
                     let name = '';
                     try {
                         let url = new URL(handler);
                         name = url.searchParams.get('label') || '';
                     } catch(e) {}
-        
-                    // Fallback do appOption
+
                     if(!name) {
                         let savedNames = getSavedProviders();
                         name = savedNames[code] || code;
                     }
-        
+
                     html += `<div class="provider-item">
                                 <div>
                                     <strong>${name}</strong><br>
@@ -709,9 +747,9 @@ async def bitrix_app(request: Request):
         }
 
         function addDynamicProvider() {
-            let name = document.getElementById("new_provider_name").value;
+            let name    = document.getElementById("new_provider_name").value;
             let fromNum = document.getElementById("new_provider_from").value;
-            let token = BX24.appOption.get('api_token') || "";
+            let token   = BX24.appOption.get('api_token') || "";
 
             if(!name || !fromNum) {
                 alert("Wypełnij nazwę i numer nadawcy!");
@@ -722,8 +760,8 @@ async def bitrix_app(request: Request):
                 return;
             }
 
-            let uniqueCode = 'plfon_' + Date.now();
-            let baseUrl = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
+            let uniqueCode        = 'plfon_' + Date.now();
+            let baseUrl           = "https://sms.jenaeuropa.pl/bitrix/send-sms-native";
             let handlerWithConfig = baseUrl + "?token=" + encodeURIComponent(token) + "&from_=" + encodeURIComponent(fromNum) + "&label=" + encodeURIComponent(name);
 
             document.getElementById('provider_list').innerHTML = "Trwa dodawanie do Bitrix24...";
@@ -742,7 +780,6 @@ async def bitrix_app(request: Request):
                         alert("Błąd dodawania: " + result.error());
                         loadProviders();
                     } else {
-                        // Sukces: Zapisujemy ładną nazwę do pamięci i czyścimy formularz
                         saveProviderName(uniqueCode, name);
                         document.getElementById("new_provider_name").value = "";
                         document.getElementById("new_provider_from").value = "";
@@ -755,12 +792,11 @@ async def bitrix_app(request: Request):
         function deleteDynamicProvider(code) {
             if(confirm("Czy na pewno chcesz bezpowrotnie usunąć tego nadawcę?")) {
                 document.getElementById('provider_list').innerHTML = "Usuwanie...";
-                
+
                 BX24.callMethod('messageservice.sender.delete', { CODE: code }, function(result) {
                     if(result.error()) {
                         alert("Błąd usuwania: " + result.error());
                     } else {
-                        // Usuwamy nazwę również z naszej pamięci
                         removeProviderName(code);
                     }
                     setTimeout(loadProviders, 1000);
@@ -775,4 +811,5 @@ async def bitrix_app(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="localhost", port=port)
