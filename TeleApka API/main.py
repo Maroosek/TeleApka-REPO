@@ -109,6 +109,55 @@ class SendSMSRequest(BaseModel):
 
 # --- ENDPOINTY ---
 
+@app.get("/sms/search")
+async def search_sms_by_phone(
+        phone: str,
+        limit: int = 50,
+        token: str = Depends(verify_token)
+):
+    """
+    Wyszukuje SMS-y przychodzące po numerze telefonu odbiorcy (pole 'to').
+    Wymaga nagłówka: Authorization: Bearer <twój_token>
+
+    Parametry:
+    - phone: numer telefonu w formacie e164, np. 48123456789
+    - limit: maksymalna liczba wyników (domyślnie 50, max 200)
+    """
+    if collection_incoming is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if not phone:
+        raise HTTPException(status_code=400, detail="Parametr 'phone' jest wymagany")
+
+    if limit > 200:
+        limit = 200
+
+    try:
+        cursor = collection_incoming.find(
+            {"to": phone},
+            {"_id": 1, "from": 1, "to": 1, "text": 1, "receive_date": 1, "created_at": 1, "bitrix": 1}
+        ).sort("receive_date", -1).limit(limit)
+
+        results = []
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            if "receive_date" in doc and doc["receive_date"]:
+                doc["receive_date"] = doc["receive_date"].isoformat()
+            if "created_at" in doc and doc["created_at"]:
+                doc["created_at"] = doc["created_at"].isoformat()
+            results.append(doc)
+
+        return {
+            "phone": phone,
+            "count": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 async def root():
     return {"message": "API SMSowni 2.0", "docs": "/docs"}
