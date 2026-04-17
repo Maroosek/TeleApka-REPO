@@ -1,4 +1,6 @@
 import os
+import traceback
+
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -182,24 +184,68 @@ async def search_sms_by_phone(
 # Nowa potężna taśma na wieki
 # -----------------------------
 
+def add_external_call_with_recording(phone_number, user_id, record_url, duration=60, entity_type=None, entity_id=None):
+    """
+    Rejestruje połączenie i podpina pod nie link do nagrania.
+    Jeśli podano entity_type i entity_id, przypisuje nagranie do konkretnego rekordu.
+    W przeciwnym razie Bitrix szuka po numerze telefonu lub tworzy nowy Lead.
+    """
+    print(f"--- PROCESOWANIE NAGRANIA DLA: {phone_number} ---")
+
+    reg_params = {
+        "USER_ID": user_id,
+        "PHONE_NUMBER": phone_number,
+        "TYPE": 2,
+        "SHOW": 0
+    }
+
+    # Jeśli przekazaliśmy konkretne ID z zewnątrz:
+    if entity_type and entity_id:
+        reg_params["CRM_CREATE"] = 0
+        reg_params["CRM_ENTITY_TYPE"] = entity_type
+        reg_params["CRM_ENTITY_ID"] = entity_id
+        print(f"📌 Wymuszono przypisanie do: {entity_type} [{entity_id}]")
+    else:
+        # Domyślne zachowanie (szukaj lub twórz)
+        reg_params["CRM_CREATE"] = 1
+
+    reg_result = bitrix_call(BitrixConfig.WEBHOOK_URL_CHATBOT, "telephony.externalcall.register", reg_params)
+
+    if "result" in reg_result:
+        call_id = reg_result["result"]["CALL_ID"]
+        crm_entity_id = reg_result["result"].get("CRM_ENTITY_ID")
+        print(f"✅ Połączenie zarejestrowane. CALL_ID: {call_id}, Lead/Entity ID: {crm_entity_id}")
+
+        # KROK 2: Zakończenie połączenia i wysłanie linku do nagrania
+        finish_params = {
+            "CALL_ID": call_id,
+            "USER_ID": user_id,
+            "DURATION": duration,
+            "RECORD_URL": record_url
+        }
+
+        finish_result = bitrix_call(BitrixConfig.WEBHOOK_URL_CHATBOT, "telephony.externalcall.finish", finish_params)
+
+        if "result" in finish_result:
+            print("✅ Nagranie zostało pomyślnie przekazane do Bitrix24.")
+        else:
+            print("❌ Błąd podczas przesyłania nagrania:", finish_result)
+
+        return finish_result
+    else:
+        print("❌ Błąd rejestracji połączenia:", reg_result)
+        return reg_result
+
+
 @app.post("/bitrix/reassign-activities")
 async def reassign_activities_from_phone_system(
-        responsible_id: int = 357,
+        responsible_id: int = 223,
         # token: str = Depends(verify_bitrix)
 ):
     """
-    Wyszukuje aktywności przypisane do użytkownika responsible_id (domyślnie 301),
-    parsuje DESCRIPTION w poszukiwaniu "BitrixId : {id}", a następnie przepisuje
-    właścicieli na znaleziony BitrixId.
-
-    Proces:
-    1. Pobiera wszystkie aktywności dla responsible_id (z uwzględnieniem paginacji Bitrix)
-    2. Znajduje BitrixId w DESCRIPTION (wzorzec: "BitrixId : {id}")
-    3. Aktualizuje RESPONSIBLE_ID w aktywności
-    4. Aktualizuje ASSIGNED_BY_ID w powiązanym Lead/Deal
-    5. Aktualizuje ASSIGNED_BY_ID w powiązanym Contact
-
-    Wymaga nagłówka: Authorization: Bearer <twój_token>
+    Wyszukuje aktywności przypisane do użytkownika responsible_id (domyślnie 357),
+    parsuje DESCRIPTION w poszukiwaniu "BitrixId : {id}" oraz ewentualnego "Recording: \n {link}".
+    Przepisuje właścicieli na znaleziony BitrixId tylko wtedy, gdy wymagają oni aktualizacji.
     """
     print(f"\n{'=' * 80}")
     print(f"🔄 START: Przepisywanie właścicieli dla RESPONSIBLE_ID={responsible_id}")
@@ -208,11 +254,13 @@ async def reassign_activities_from_phone_system(
     # Regex do wyciągnięcia BitrixId z DESCRIPTION
     bitrix_id_pattern = re.compile(r'BitrixId\s*:\s*(\d+)\s*[:|\n]')
 
+    # Regex do wyciągnięcia URL nagrania z DESCRIPTION (szuka nowej linii po "Recording:")
+    recording_pattern = re.compile(r'Recording:[\s\r\n]*(https?://[^\s]+)', re.IGNORECASE)
+
     processed_activities = []
     errors = []
 
     try:
-        # 1. Pobierz wszystkie aktywności dla danego RESPONSIBLE_ID (PAGINACJA)
         print(f"📥 Pobieranie aktywności dla RESPONSIBLE_ID={responsible_id}...")
 
         activities = []
@@ -224,7 +272,8 @@ async def reassign_activities_from_phone_system(
                 "crm.activity.list.json",
                 {
                     "filter": {"RESPONSIBLE_ID": responsible_id},
-                    "select": ["ID", "DESCRIPTION", "OWNER_ID", "OWNER_TYPE_ID", "RESPONSIBLE_ID"],
+                    # Dodano COMMUNICATIONS w select aby mieć szybki dostęp do numeru telefonu
+                    "select": ["ID", "DESCRIPTION", "OWNER_ID", "OWNER_TYPE_ID", "RESPONSIBLE_ID", "COMMUNICATIONS"],
                     "start": start_param
                 }
             )
@@ -238,7 +287,6 @@ async def reassign_activities_from_phone_system(
             current_batch = activities_result.get("result", [])
             activities.extend(current_batch)
 
-            # Sprawdź, czy Bitrix zwraca klucz 'next', oznaczający kolejne strony wyników
             if "next" in activities_result:
                 start_param = activities_result["next"]
                 print(f"   ⏳ Pobrno {len(activities)} aktywności, pobieranie kolejnej paczki (start={start_param})...")
@@ -255,28 +303,24 @@ async def reassign_activities_from_phone_system(
                 "errors": []
             }
 
-        # 2. Przetwarzaj każdą aktywność
         for activity in activities:
             activity_id = activity.get("ID")
             description = activity.get("DESCRIPTION", "")
             owner_id = activity.get("OWNER_ID")
             owner_type_id = activity.get("OWNER_TYPE_ID")
 
-            # Znajdź BitrixId w DESCRIPTION
             match = bitrix_id_pattern.search(description)
-
             if not match:
                 continue
 
             new_bitrix_id = match.group(1)
             print(f"   ✅ Znaleziono BitrixId: {new_bitrix_id} w Aktywności ID={activity_id}")
 
-            activity_update_result = {"activity": None, "lead_or_deal": None, "contact": None}
+            activity_update_result = {"activity": None, "lead_or_deal": None, "contact": None, "recording": None}
 
             try:
-                # 3. Aktualizuj RESPONSIBLE_ID w aktywności
+                # 3. Aktualizuj RESPONSIBLE_ID w samej aktywności
                 print(f"   📝 Aktualizuję RESPONSIBLE_ID w aktywności {activity_id}...")
-
                 update_activity = bitrix_call(
                     BitrixConfig.WEBHOOK_URL_CHATBOT,
                     "crm.activity.update.json",
@@ -292,12 +336,12 @@ async def reassign_activities_from_phone_system(
                 activity_update_result["activity"] = f"Zaktualizowano RESPONSIBLE_ID na {new_bitrix_id}"
                 print(f"   ✅ Aktywność zaktualizowana")
 
-                # 4. Aktualizuj ASSIGNED_BY_ID w Lead/Deal
+                # 4. Sprawdź i aktualizuj ASSIGNED_BY_ID w Lead/Deal (Tylko jeśli jest różnica)
                 if owner_id and owner_type_id:
-                    entity_type = "lead" if owner_type_id == "1" else "deal"
-                    print(f"   📝 Aktualizuję ASSIGNED_BY_ID w {entity_type} {owner_id}...")
+                    entity_type = "lead" if str(owner_type_id) == "1" else "deal"
+                    # Oznaczenie pod interfejs Telephony API: LEAD / DEAL wielkimi literami
+                    telephony_entity_type = "LEAD" if str(owner_type_id) == "1" else "DEAL"
 
-                    # Pobierz Lead/Deal żeby sprawdzić CONTACT_ID
                     get_entity = bitrix_call(
                         BitrixConfig.WEBHOOK_URL_CHATBOT,
                         f"crm.{entity_type}.get.json",
@@ -307,43 +351,90 @@ async def reassign_activities_from_phone_system(
                     if "error" not in get_entity:
                         entity_data = get_entity.get("result", {})
                         contact_id = entity_data.get("CONTACT_ID")
+                        current_assigned_by = str(entity_data.get("ASSIGNED_BY_ID", ""))
 
-                        # Aktualizuj ASSIGNED_BY_ID w Lead/Deal
-                        update_entity = bitrix_call(
-                            BitrixConfig.WEBHOOK_URL_CHATBOT,
-                            f"crm.{entity_type}.update.json",
-                            {
-                                "id": owner_id,
-                                "fields": {"ASSIGNED_BY_ID": new_bitrix_id}
-                            }
-                        )
+                        # Weryfikacja: działaj tylko podczas zmiany osoby responsible
+                        if current_assigned_by != str(new_bitrix_id):
+                            print(
+                                f"   📝 Zmiana osoby odpowiedzialnej z {current_assigned_by} na {new_bitrix_id} w {entity_type} {owner_id}...")
 
-                        if "error" in update_entity:
-                            raise Exception(f"Błąd aktualizacji {entity_type}: {update_entity['error']}")
-
-                        activity_update_result["lead_or_deal"] = f"Zaktualizowano {entity_type} {owner_id}"
-                        print(f"   ✅ {entity_type.capitalize()} zaktualizowany")
-
-                        # 5. Aktualizuj ASSIGNED_BY_ID w Contact
-                        if contact_id:
-                            print(f"   📝 Aktualizuję ASSIGNED_BY_ID w kontakcie {contact_id}...")
-
-                            update_contact = bitrix_call(
+                            # Zapisz zmianę właściciela Leada/Deala
+                            update_entity = bitrix_call(
                                 BitrixConfig.WEBHOOK_URL_CHATBOT,
-                                "crm.contact.update.json",
+                                f"crm.{entity_type}.update.json",
                                 {
-                                    "id": contact_id,
+                                    "id": owner_id,
                                     "fields": {"ASSIGNED_BY_ID": new_bitrix_id}
                                 }
                             )
 
-                            if "error" in update_contact:
-                                raise Exception(f"Błąd aktualizacji kontaktu: {update_contact['error']}")
+                            if "error" in update_entity:
+                                raise Exception(f"Błąd aktualizacji {entity_type}: {update_entity['error']}")
 
-                            activity_update_result["contact"] = f"Zaktualizowano kontakt {contact_id}"
-                            print(f"   ✅ Kontakt zaktualizowany")
+                            activity_update_result["lead_or_deal"] = f"Zaktualizowano {entity_type} {owner_id}"
+                            print(f"   ✅ {entity_type.capitalize()} zaktualizowany")
+
+                            # --- DODANIE NAGRANIA DO BITRIX ---
+                            # Szukamy URL nagrania w DESCRIPTION (Skoro zaktualizowaliśmy właściciela)
+                            rec_match = recording_pattern.search(description)
+
+                            if rec_match:
+                                record_url = rec_match.group(1)
+                                print(f"   🎤 Znaleziono link do nagrania: {record_url}")
+
+                                # Wyciągamy numer telefonu z powiązanej tablicy COMMUNICATIONS
+                                phone_number = None
+                                for comm in activity.get("COMMUNICATIONS", []):
+                                    if comm.get("TYPE") == "PHONE":
+                                        phone_number = comm.get("VALUE")
+                                        break
+
+                                # Jeżeli brak w komunikacji aktywności, wyciągnijmy z danych obiektu
+                                if not phone_number:
+                                    phones = entity_data.get("PHONE", [])
+                                    if phones and isinstance(phones, list):
+                                        phone_number = phones[0].get("VALUE")
+
+                                if phone_number:
+                                    add_external_call_with_recording(
+                                        phone_number=phone_number,
+                                        user_id=new_bitrix_id,
+                                        record_url=record_url,
+                                        entity_type=telephony_entity_type,
+                                        entity_id=owner_id
+                                    )
+                                    activity_update_result["recording"] = "Podpięto nagranie do rekordu"
+                                else:
+                                    print("   ⚠️ Pominięto rejestrację połączenia - brak numeru telefonu")
+                                    activity_update_result["recording"] = "Brak numeru telefonu"
+                            else:
+                                print("   ℹ️ Brak linku do nagrania we wzorcu 'Recording: <link>'")
+
+                            # 5. Aktualizuj ASSIGNED_BY_ID w Contact
+                            if contact_id:
+                                print(f"   📝 Aktualizuję ASSIGNED_BY_ID w kontakcie {contact_id}...")
+                                update_contact = bitrix_call(
+                                    BitrixConfig.WEBHOOK_URL_CHATBOT,
+                                    "crm.contact.update.json",
+                                    {
+                                        "id": contact_id,
+                                        "fields": {"ASSIGNED_BY_ID": new_bitrix_id}
+                                    }
+                                )
+
+                                if "error" in update_contact:
+                                    raise Exception(f"Błąd aktualizacji kontaktu: {update_contact['error']}")
+
+                                activity_update_result["contact"] = f"Zaktualizowano kontakt {contact_id}"
+                                print(f"   ✅ Kontakt zaktualizowany")
+                            else:
+                                print(f"   ℹ️ Brak CONTACT_ID w {entity_type}")
+
                         else:
-                            print(f"   ℹ️ Brak CONTACT_ID w {entity_type}")
+                            print(
+                                f"   ℹ️ Posiadał już przypisanego właściciela ({new_bitrix_id}). Pomijam re-przypisanie obiektu i wgrywanie nagrania.")
+                            activity_update_result["lead_or_deal"] = "Pominięto (właściciel już był aktualny)"
+
                     else:
                         raise Exception(f"Błąd pobierania {entity_type}: {get_entity['error']}")
 
@@ -375,7 +466,6 @@ async def reassign_activities_from_phone_system(
         }
 
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
