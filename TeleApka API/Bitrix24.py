@@ -146,6 +146,7 @@ def _find_latest_crm_record(contact_ids: list[str]) -> dict | None:
     """
     Dla podanych ID kontaktów przeszukuje Leady i Deale.
     Zwraca jeden rekord (najnowszy wg ID DESC) wraz z typem właściciela.
+    Ignoruje Leady ze statusem "CONVERTED".
 
     Zwracany słownik:
       {
@@ -163,11 +164,15 @@ def _find_latest_crm_record(contact_ids: list[str]) -> dict | None:
             "crm.lead.list.json",
             {
                 "filter": {"CONTACT_ID": contact_id},
-                "select": ["ID", "ASSIGNED_BY_ID"],
-                "order":  {"ID": "DESC"},
+                "select": ["ID", "ASSIGNED_BY_ID", "STATUS_ID"],
+                "order": {"ID": "DESC"},
             },
         )
         for lead in lead_result.get("result", []):
+            # Zignoruj leady, które zostały już przekonwertowane
+            if lead.get("STATUS_ID") == "CONVERTED":
+                continue
+
             candidates.append(
                 (int(lead["ID"]), "1", lead.get("ASSIGNED_BY_ID", "1"))
             )
@@ -179,7 +184,7 @@ def _find_latest_crm_record(contact_ids: list[str]) -> dict | None:
             {
                 "filter": {"CONTACT_ID": contact_id},
                 "select": ["ID", "ASSIGNED_BY_ID"],
-                "order":  {"ID": "DESC"},
+                "order": {"ID": "DESC"},
             },
         )
         for deal in deal_result.get("result", []):
@@ -198,8 +203,8 @@ def _find_latest_crm_record(contact_ids: list[str]) -> dict | None:
     print(f"✅ Najnowszy rekord: {type_label} ID={owner_id}, opiekun={responsible_id}")
 
     return {
-        "OWNER_ID":       str(owner_id),
-        "OWNER_TYPE_ID":  owner_type_id,
+        "OWNER_ID": str(owner_id),
+        "OWNER_TYPE_ID": owner_type_id,
         "RESPONSIBLE_ID": str(responsible_id),
     }
 

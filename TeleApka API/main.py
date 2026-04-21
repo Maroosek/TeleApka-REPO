@@ -558,9 +558,9 @@ async def receive_sms(request: Request):
                 bitrix_log["responsible_id"] = responsible
 
                 description = (
-                    f"[B]SMS od:[/B] {sms_from}\n"
-                    f"[B]Data:[/B] {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"[B]Treść:[/B]\n{sms_text}"
+                    f"SMS od: {sms_from}\n"
+                    f"Data: {receive_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Treść:\n{sms_text}"
                 )
                 activity_id = add_new_activity(owner_id, owner_type_id, responsible, description)
 
