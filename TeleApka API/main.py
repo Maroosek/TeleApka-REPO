@@ -6,7 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import re
 
@@ -239,7 +239,7 @@ def add_external_call_with_recording(phone_number, user_id, record_url, duration
 
 @app.post("/bitrix/reassign-activities")
 async def reassign_activities_from_phone_system(
-        responsible_id: int = 223,
+        responsible_id: int = 357,
         # token: str = Depends(verify_bitrix)
 ):
     """
@@ -261,18 +261,23 @@ async def reassign_activities_from_phone_system(
     errors = []
 
     try:
-        print(f"📥 Pobieranie aktywności dla RESPONSIBLE_ID={responsible_id}...")
+        #print(f"📥 Pobieranie aktywności dla RESPONSIBLE_ID={responsible_id}...")
 
         activities = []
         start_param = 0
+
+        week_ago = datetime.now() - timedelta(weeks=1)
+        week_ago_str = week_ago.strftime('%Y-%m-%dT00:00:00+01:00')
 
         while True:
             activities_result = bitrix_call(
                 BitrixConfig.WEBHOOK_URL_CHATBOT,
                 "crm.activity.list.json",
                 {
-                    "filter": {"RESPONSIBLE_ID": responsible_id},
-                    # Dodano COMMUNICATIONS w select aby mieć szybki dostęp do numeru telefonu
+                    "filter": {
+                        "RESPONSIBLE_ID": responsible_id,
+                        ">=CREATED": week_ago_str
+                    },
                     "select": ["ID", "DESCRIPTION", "OWNER_ID", "OWNER_TYPE_ID", "RESPONSIBLE_ID", "COMMUNICATIONS"],
                     "start": start_param
                 }
@@ -289,11 +294,11 @@ async def reassign_activities_from_phone_system(
 
             if "next" in activities_result:
                 start_param = activities_result["next"]
-                print(f"   ⏳ Pobrno {len(activities)} aktywności, pobieranie kolejnej paczki (start={start_param})...")
+                #print(f"   ⏳ Pobrno {len(activities)} aktywności, pobieranie kolejnej paczki (start={start_param})...")
             else:
                 break
 
-        print(f"✅ Znaleziono łącznie {len(activities)} aktywności do przetworzenia\n")
+        #print(f"✅ Znaleziono łącznie {len(activities)} aktywności do przetworzenia\n")
 
         if not activities:
             return {
@@ -722,10 +727,6 @@ async def send_sms(
         print(f"❌ Błąd HTTP do plfon.pl: {e}")
         raise HTTPException(status_code=502, detail=f"Błąd połączenia z plfon.pl: {e}")
 
-
-from fastapi.responses import HTMLResponse
-
-
 # Sekcja bitrixowa
 
 @app.post("/bitrix/send-sms-native")
@@ -794,9 +795,6 @@ async def bitrix_native_sms(
     except Exception as e:
         print(f"❌ Błąd wysyłki: {e}")
         return Response(content=str(e), status_code=500)
-
-
-from fastapi.responses import HTMLResponse
 
 
 @app.get("/app", response_class=HTMLResponse)
