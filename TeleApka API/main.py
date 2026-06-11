@@ -649,7 +649,7 @@ async def send_sms(
         raise HTTPException(status_code=500, detail="Brak konfiguracji danych logowania plfon.pl")
 
     recipients = [r.strip() for r in payload.to.split(",") if r.strip()]
-    if len(recipients) > 10:
+    if len(recipients) > 100:
         raise HTTPException(
             status_code=400,
             detail=f"Zbyt wielu odbiorców ({len(recipients)}). Maksimum to 10 na jedno wywołanie."
